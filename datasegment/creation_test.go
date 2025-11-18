@@ -36,9 +36,10 @@ func TestAggregateCreation(t *testing.T) {
 	a, err := NewAggregate(dealSize, subPieceInfos)
 	assert.NoError(t, err)
 	assert.NotNil(t, a)
-	expectedPieceCID := Must(cid.Cast([]byte{0x1, 0x81, 0xe2, 0x3, 0x92, 0x20, 0x20, 0x3f, 0x46, 0xbc, 0x64,
-		0x5b, 0x7, 0xa3, 0xea, 0x2c, 0x4, 0xf0, 0x66, 0xf9, 0x39, 0xdd, 0xf7, 0xe2, 0x69, 0xdd,
-		0x77, 0x67, 0x1f, 0x9e, 0x1e, 0x61, 0xa3, 0xa3, 0x79, 0x7e, 0x66, 0x51, 0x27}))
+	// Updated expected PieceCID for v2 format (4 nodes per entry instead of 2)
+	expectedPieceCID := Must(cid.Cast([]byte{0x1, 0x81, 0xe2, 0x3, 0x92, 0x20, 0x20, 0xcc, 0x6e, 0xf8, 0x1f,
+		0x1d, 0xb1, 0x5b, 0xa8, 0x65, 0xb2, 0x6d, 0xf6, 0x9e, 0x22, 0x8a, 0x6d, 0x2f, 0xa8, 0xd7,
+		0x61, 0x9b, 0x84, 0x3b, 0x5c, 0x5b, 0x73, 0x2b, 0xcf, 0x1b, 0x7b, 0xd, 0xf}))
 	pcid, err := a.PieceCID()
 	assert.NoError(t, err)
 	assert.Equal(t, expectedPieceCID, pcid)
@@ -50,7 +51,10 @@ func TestAggregateCreation(t *testing.T) {
 		assert.NoError(t, err)
 		parsedValidEntries, err := parsedIndex.ValidEntries()
 		assert.NoError(t, err)
-		assert.Equal(t, a.Index.Entries, parsedValidEntries)
+		// Convert interface to IndexData to access Entries
+		indexData, ok := a.Index.(*IndexData)
+		require.True(t, ok, "Index should be *IndexData")
+		assert.Equal(t, indexData.Entries, parsedValidEntries)
 	})
 
 	for _, pi := range subPieceInfos {
@@ -95,7 +99,8 @@ func TestAggregateObjectReader(t *testing.T) {
 	assert.NoError(t, err)
 	pieceCid := Must(commcid.PieceCommitmentV1ToCID(commp))
 	assert.Equal(t, uint64(dealSize), uint64(paddedSize))
-	assert.Equal(t, cid.MustParse("baga6ea4seaqnqkeoqevjjjfe46wo2lpfclcbmkyms4wkz5srou3vzmr3w3c72bq"), pieceCid)
+	// Updated expected PieceCID for v2 format (4 nodes per entry instead of 2)
+	assert.Equal(t, cid.MustParse("baga6ea4seaqmhk5veixmhhyup33axucdmw535adf7xkqzl72jknmblyzyf7iqea"), pieceCid)
 	assert.Equal(t, pieceCid, Must(a.PieceCID()))
 
 }
@@ -239,7 +244,10 @@ func TestAggregateSample(t *testing.T) {
 	require.NoError(t, err)
 
 	{
-		_, err = f.Seek(int64(a.Index.Entries[0].UnpaddedOffest()), io.SeekStart)
+		// Convert interface to IndexData to access Entry
+		indexData, ok := a.Index.(*IndexData)
+		require.True(t, ok, "Index should be *IndexData")
+		_, err = f.Seek(int64(indexData.Entry(0).UnpaddedOffest()), io.SeekStart)
 		require.NoError(t, err)
 		p0, err := os.Open("testdata/sample_aggregate/cat.png.car")
 		require.NoError(t, err)
@@ -249,7 +257,10 @@ func TestAggregateSample(t *testing.T) {
 	{
 		p1, err := os.Open("testdata/sample_aggregate/Verifiable Data Aggregation.png.car")
 		require.NoError(t, err)
-		_, err = f.Seek(int64(a.Index.Entries[1].UnpaddedOffest()), io.SeekStart)
+		// Convert interface to IndexData to access Entry
+		indexData, ok := a.Index.(*IndexData)
+		require.True(t, ok, "Index should be *IndexData")
+		_, err = f.Seek(int64(indexData.Entry(1).UnpaddedOffest()), io.SeekStart)
 		require.NoError(t, err)
 		_, err = io.Copy(f, p1)
 		require.NoError(t, err)
@@ -275,13 +286,19 @@ func TestAggregateSample(t *testing.T) {
 		indexStart := DataSegmentIndexStartOffset(dealSize)
 		f.Seek(int64(indexStart), io.SeekStart)
 
-		indexData, err := ParseDataSegmentIndex(f)
+		parsedIndexData, err := ParseDataSegmentIndex(f)
 		require.NoError(t, err)
-		assert.Equal(t, Must(a.Index.ValidEntries()), Must(indexData.ValidEntries()))
+		// Convert interface to IndexData to access ValidEntries
+		indexData, ok := a.Index.(*IndexData)
+		require.True(t, ok, "Index should be *IndexData")
+		assert.Equal(t, Must(indexData.ValidEntries()), Must(parsedIndexData.ValidEntries()))
 	}
 	indexJson, err := os.Create("testdata/sample_aggregate/index.json")
 	require.NoError(t, err)
-	entries, err := a.Index.ValidEntries()
+	// Convert interface to IndexData to access ValidEntries
+	indexData, ok := a.Index.(*IndexData)
+	require.True(t, ok, "Index should be *IndexData")
+	entries, err := indexData.ValidEntries()
 	require.NoError(t, err)
 
 	enc := json.NewEncoder(indexJson)
@@ -301,7 +318,8 @@ func TestAggregateSample(t *testing.T) {
 	assert.NoError(t, err)
 	pieceCid := Must(commcid.PieceCommitmentV1ToCID(commp))
 	assert.Equal(t, uint64(dealSize), uint64(paddedSize))
-	assert.Equal(t, cid.MustParse("baga6ea4seaqnqkeoqevjjjfe46wo2lpfclcbmkyms4wkz5srou3vzmr3w3c72bq"),
+	// Updated expected PieceCID for v2 format (4 nodes per entry instead of 2)
+	assert.Equal(t, cid.MustParse("baga6ea4seaqmhk5veixmhhyup33axucdmw535adf7xkqzl72jknmblyzyf7iqea"),
 		pieceCid)
 	assert.Equal(t, pieceCid, Must(a.PieceCID()))
 }
