@@ -2,7 +2,6 @@ package index
 
 import (
 	"fmt"
-	"golang.org/x/xerrors"
 	"testing"
 
 	"github.com/filecoin-project/go-data-segment/fr32"
@@ -54,10 +53,12 @@ func invalidEntry2() SegmentDescV2 {
 }
 
 // makes an index with entries that may be invalid in some way (e.g., alignment)
-// but have valid v2 format fields and checksums for serialization testing
+// but have validPos v2 format fields and checksums for serialization testing
 func invalidIndex() IndexData {
+	e1 := invalidEntry1()
+	e2 := invalidEntry2()
 	index := IndexData{
-		Entries: []SegmentDescV2{invalidEntry1(), invalidEntry2()},
+		Entries: []*SegmentDescV2{&e1, &e2},
 	}
 	return index
 }
@@ -65,11 +66,9 @@ func invalidIndex() IndexData {
 func validIndex(t *testing.T) IndexData {
 	comm1 := fr32.Fr32{1}
 	comm2 := fr32.Fr32{2}
-	entry1, err1 := MakeDataSegmentIdx(&comm1, 128, 256)
-	assert.Nil(t, err1)
-	entry2, err2 := MakeDataSegmentIdx(&comm2, 128<<5, 128<<4)
-	assert.Nil(t, err2)
-	index, err3 := MakeIndex([]SegmentDescV2{entry1, entry2})
+	entry1 := NewDataSegmentIndexEntry(&comm1, 128, 256)
+	entry2 := NewDataSegmentIndexEntry(&comm2, 128<<5, 128<<4)
+	index, err3 := MakeIndex([]*SegmentDescV2{entry1, entry2})
 	assert.Nil(t, err3)
 	return *index
 }
@@ -112,8 +111,6 @@ func TestIndexSerializationValidation(t *testing.T) {
 	err = decoded.UnmarshalBinary(encoded)
 	assert.NoError(t, err)
 	assert.NotNil(t, decoded)
-	err = decoded.Validate()
-	assert.NoError(t, err)
 	assert.Equal(t, index, decoded)
 }
 
@@ -138,16 +135,15 @@ func TestIndexSerialization(t *testing.T) {
 }
 
 func TestIndexLargeSizes(t *testing.T) {
-	index := validIndex(t)
-	MakeIndex(index.Entries)
-}
-
-// NEGATIVE TESTS
-func TestSegmentEntryNegativeMakeError(t *testing.T) {
-	en := invalidEntry1()
-	en, err := MakeDataSegmentIdxWithChecksum((*fr32.Fr32)(&en.CommDs), en.Offset, en.Size, &en.Checksum)
-	assert.Error(t, err)
-	assert.Empty(t, en)
+	idx := validIndex(t)
+	// Convert pointer slice to value slice for MakeIndex
+	entries := make([]*SegmentDescV2, len(idx.Entries))
+	for i, e := range idx.Entries {
+		if e != nil {
+			entries[i] = e
+		}
+	}
+	MakeIndex(entries)
 }
 
 func TestSegmentEntryValidateFail(t *testing.T) {
@@ -165,11 +161,9 @@ func TestIndexInvalidEntries(t *testing.T) {
 	err = decoded.UnmarshalBinary(b)
 	assert.NoError(t, err)
 	assert.Equal(t, index, decoded)
-	err = index.Validate()
-	assert.ErrorIs(t, err, ErrValidation)
-	err = decoded.Validate()
-	assert.ErrorIs(t, err, ErrValidation)
-
+	entries1 := index.ListEntries()
+	entries2 := decoded.ListEntries()
+	assert.Equal(t, entries1, entries2)
 }
 
 func TestNegativeIndexCreation(t *testing.T) {
@@ -179,52 +173,9 @@ func TestNegativeIndexCreation(t *testing.T) {
 	assert.Nil(t, index)
 }
 
-func TestNegativeSerialization(t *testing.T) {
-	// nil entries
-	data := &IndexData{Entries: nil}
-	serialized, err := SerializeIndex(data)
-	assert.Error(t, err)
-	assert.Nil(t, serialized)
-
-	// Empty entries
-	data = &IndexData{Entries: make([]SegmentDescV2, 0)}
-	serialized, err = SerializeIndex(data)
-	assert.Error(t, err)
-	assert.Nil(t, serialized)
-}
-
-func TestNegativeSerializationIndexNil(t *testing.T) {
-	// nil
-	serialized, err := SerializeIndex(nil)
-	assert.Error(t, err)
-	assert.Nil(t, serialized)
-}
-
-func TestDealSizeSmallerThanSegmentDesciptions(t *testing.T) {
-	// Too small deal
-	en := SegmentDescV2{
-		CommDs:   Node{},
-		Offset:   123,
-		Size:     12222,
-		Checksum: [ChecksumSize]byte{},
-	}
-	index := IndexData{Entries: []SegmentDescV2{en}}
-	assert.Error(t, validateIndexStructure(&index))
-}
-
-func TestNegativeMakeDescWrongSegments(t *testing.T) {
-	segments := make([]merkletree.Node, 10)
-	sizes := make([]uint64, 11)
-	_, err := MakeSegDescs(segments, sizes)
-	assert.Error(t, err)
-}
-
-func MakeIndex(entries []SegmentDescV2) (*IndexData, error) {
+func MakeIndex(entries []*SegmentDescV2) (*IndexData, error) {
 	index := IndexData{
 		Entries: entries,
-	}
-	if err := validateIndexStructure(&index); err != nil {
-		return nil, xerrors.Errorf("input data is invalid: %w", err)
 	}
 	return &index, nil
 }

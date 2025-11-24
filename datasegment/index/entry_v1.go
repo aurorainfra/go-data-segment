@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding"
 	"encoding/binary"
+	"github.com/filecoin-project/go-data-segment/fr32"
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"golang.org/x/xerrors"
 )
@@ -30,18 +31,7 @@ type SegmentDescV1 struct {
 
 // ToV2 converts a V1 segment description to V2 format
 func (sd SegmentDescV1) ToV2() SegmentDescV2 {
-	return SegmentDescV2{
-		CommDs:              sd.CommDs,
-		Offset:              sd.Offset,
-		Size:                sd.Size,
-		RawSize:             sd.Size, // Default to size for v1 compatibility
-		Multicodec:          MulticodecRaw,
-		MulticodecDependent: merkletree.Node{},
-		ACLType:             0,
-		ACLData:             0,
-		Reserved:            [7]byte{},
-		Checksum:            [ChecksumSize]byte{}, // Will be recomputed
-	}.withUpdatedChecksum()
+	return *NewDataSegmentIndexEntry((*fr32.Fr32)(&sd.CommDs), sd.Offset, sd.Size)
 }
 
 var _ encoding.BinaryMarshaler = SegmentDescV1{}

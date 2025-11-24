@@ -21,7 +21,7 @@ func DataSegmentIndexStartOffset(dealSize abi.PaddedPieceSize) uint64 {
 
 // ParseDataSegmentIndex takes in a reader of of unppaded deal data, it should start at offset
 // returned by DataSegmentIndexStartOffset
-// After parsing use IndexData#ValidEntries() to gather valid data segments
+// After parsing use IndexData#validPos() to gather validPos data segments
 func ParseDataSegmentIndex(unpaddedReader io.Reader) (IndexData, error) {
 	const (
 		unpaddedChunk = 127
@@ -74,7 +74,7 @@ func ParseDataSegmentIndex(unpaddedReader io.Reader) (IndexData, error) {
 	numEntries := uint64(len(unpaddedData)) / unpaddedEntrySize
 
 	// Pre-allocate entries slice to hold all entries (including zero-filled ones)
-	allEntries := make([]SegmentDescV2, numEntries)
+	allEntries := make([]*SegmentDescV2, numEntries)
 	validEntries := make([]bool, numEntries)
 	validCnt := 0
 
@@ -84,15 +84,17 @@ func ParseDataSegmentIndex(unpaddedReader io.Reader) (IndexData, error) {
 		// The paddedData already contains the correctly padded entries
 		entryStartPadded := i * EntrySizeV2 // Each entry is EntrySize (128) bytes after padding
 		if entryStartPadded+EntrySizeV2 > uint64(len(paddedData)) {
-			// Not enough padded data, leave as zero value
+			// Not enough padded data, leave as nil
 			continue
 		}
 
 		entryData := paddedData[entryStartPadded : entryStartPadded+EntrySizeV2]
-		if err := allEntries[i].UnmarshalBinary(entryData); err != nil {
+		var entry SegmentDescV2
+		if err := entry.UnmarshalBinary(entryData); err != nil {
 			continue
 		}
-		if allEntries[i].Validate() == nil {
+		if entry.Validate() == nil {
+			allEntries[i] = &entry
 			validEntries[i] = true
 			validCnt++
 		}
@@ -103,8 +105,8 @@ func ParseDataSegmentIndex(unpaddedReader io.Reader) (IndexData, error) {
 	}
 
 	return IndexData{
-		Entries:      allEntries,
-		ValidEntries: validEntries,
+		Entries:  allEntries,
+		validPos: validEntries,
 	}, nil
 }
 
@@ -113,14 +115,14 @@ func parseDataSegmentV1(unpaddedData, paddedData []byte) (IndexData, error) {
 	numEntries := uint64(len(unpaddedData)) / unpaddedEntrySize
 
 	// Pre-allocate entries slice to hold all entries (including zero-filled ones)
-	allEntries := make([]SegmentDescV2, numEntries)
+	allEntries := make([]*SegmentDescV2, numEntries)
 	validEntries := make([]bool, numEntries)
 
 	emptyEntry := &SegmentDescV1{}
 	for i := uint64(0); i < numEntries; i++ {
 		entryStartPadded := i * EntrySizeV1
 		if entryStartPadded+EntrySizeV2 > uint64(len(paddedData)) {
-			// Not enough padded data, leave as zero value
+			// Not enough padded data, leave as nil
 			continue
 		}
 
@@ -129,14 +131,15 @@ func parseDataSegmentV1(unpaddedData, paddedData []byte) (IndexData, error) {
 		if err := emptyEntry.UnmarshalBinary(entryData); err != nil {
 			continue
 		}
-		allEntries[i] = emptyEntry.ToV2()
-		if allEntries[i].Validate() == nil {
+		v2Entry := emptyEntry.ToV2()
+		if v2Entry.Validate() == nil {
+			allEntries[i] = &v2Entry
 			validEntries[i] = true
 		}
 	}
 
 	return IndexData{
-		Entries:      allEntries,
-		ValidEntries: validEntries,
+		Entries:  allEntries,
+		validPos: validEntries,
 	}, nil
 }

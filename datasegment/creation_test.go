@@ -7,6 +7,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/filecoin-project/go-data-segment/datasegment/index"
 	"github.com/filecoin-project/go-data-segment/util"
 
 	commcid "github.com/filecoin-project/go-fil-commcid"
@@ -47,14 +48,26 @@ func TestAggregateCreation(t *testing.T) {
 	t.Run("index is properly encoded", func(t *testing.T) {
 		ir, err := a.IndexReader()
 		assert.NoError(t, err)
-		parsedIndex, err := ParseDataSegmentIndex(ir)
+		parsedIndex, err := index.ParseDataSegmentIndex(ir)
 		assert.NoError(t, err)
-		parsedValidEntries, err := parsedIndex.ValidEntries()
-		assert.NoError(t, err)
+		parsedValidEntries := parsedIndex.ListEntries()
 		// Convert interface to IndexData to access Entries
-		indexData, ok := a.Index.(*IndexData)
-		require.True(t, ok, "Index should be *IndexData")
-		assert.Equal(t, indexData.Entries, parsedValidEntries)
+		indexData, ok := a.Index.(*index.IndexData)
+		require.True(t, ok, "Index should be *index.IndexData")
+		// Convert both pointer slices to value slices for comparison
+		indexEntries := make([]index.SegmentDescV2, len(indexData.Entries))
+		for i, e := range indexData.Entries {
+			if e != nil {
+				indexEntries[i] = *e
+			}
+		}
+		parsedEntries := make([]index.SegmentDescV2, len(parsedValidEntries))
+		for i, e := range parsedValidEntries {
+			if e != nil {
+				parsedEntries[i] = *e
+			}
+		}
+		assert.Equal(t, indexEntries, parsedEntries)
 	})
 
 	for _, pi := range subPieceInfos {
@@ -245,8 +258,8 @@ func TestAggregateSample(t *testing.T) {
 
 	{
 		// Convert interface to IndexData to access Entry
-		indexData, ok := a.Index.(*IndexData)
-		require.True(t, ok, "Index should be *IndexData")
+		indexData, ok := a.Index.(*index.IndexData)
+		require.True(t, ok, "Index should be *index.IndexData")
 		_, err = f.Seek(int64(indexData.Entry(0).UnpaddedOffest()), io.SeekStart)
 		require.NoError(t, err)
 		p0, err := os.Open("testdata/sample_aggregate/cat.png.car")
@@ -258,8 +271,8 @@ func TestAggregateSample(t *testing.T) {
 		p1, err := os.Open("testdata/sample_aggregate/Verifiable Data Aggregation.png.car")
 		require.NoError(t, err)
 		// Convert interface to IndexData to access Entry
-		indexData, ok := a.Index.(*IndexData)
-		require.True(t, ok, "Index should be *IndexData")
+		indexData, ok := a.Index.(*index.IndexData)
+		require.True(t, ok, "Index should be *index.IndexData")
 		_, err = f.Seek(int64(indexData.Entry(1).UnpaddedOffest()), io.SeekStart)
 		require.NoError(t, err)
 		_, err = io.Copy(f, p1)
@@ -283,23 +296,28 @@ func TestAggregateSample(t *testing.T) {
 	}
 
 	{
-		indexStart := DataSegmentIndexStartOffset(dealSize)
+		indexStart := index.DataSegmentIndexStartOffset(dealSize)
 		f.Seek(int64(indexStart), io.SeekStart)
 
-		parsedIndexData, err := ParseDataSegmentIndex(f)
+		parsedIndexData, err := index.ParseDataSegmentIndex(f)
 		require.NoError(t, err)
-		// Convert interface to IndexData to access ValidEntries
-		indexData, ok := a.Index.(*IndexData)
-		require.True(t, ok, "Index should be *IndexData")
-		assert.Equal(t, Must(indexData.ValidEntries()), Must(parsedIndexData.ValidEntries()))
+		// Convert interface to IndexData to access valid
+		indexData, ok := a.Index.(*index.IndexData)
+		require.True(t, ok, "Index should be *index.IndexData")
+		// Compare the actual entries, not the pointer slices
+		indexEntries := indexData.ListEntries()
+		parsedEntries := parsedIndexData.ListEntries()
+		require.Equal(t, len(indexEntries), len(parsedEntries))
+		for i := range indexEntries {
+			assert.Equal(t, *indexEntries[i], *parsedEntries[i])
+		}
 	}
 	indexJson, err := os.Create("testdata/sample_aggregate/index.json")
 	require.NoError(t, err)
-	// Convert interface to IndexData to access ValidEntries
-	indexData, ok := a.Index.(*IndexData)
-	require.True(t, ok, "Index should be *IndexData")
-	entries, err := indexData.ValidEntries()
-	require.NoError(t, err)
+	// Convert interface to IndexData to access valid
+	indexData, ok := a.Index.(*index.IndexData)
+	require.True(t, ok, "Index should be *index.IndexData")
+	entries := indexData.ListEntries()
 
 	enc := json.NewEncoder(indexJson)
 	enc.SetIndent("", "  ")

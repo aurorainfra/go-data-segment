@@ -108,24 +108,12 @@ func (a Aggregate) ProofForPieceInfo(d abi.PieceInfo) (*InclusionProof, error) {
 	if entry == nil {
 		return nil, xerrors.Errorf("entry at index %d is nil", idx)
 	}
-	if entry.Size != uint64(d.Size) {
-		return nil, xerrors.Errorf("entry found but size mismatch: %d != %d", entry.Size, d.Size)
+	if size := entry.Size(); size != uint64(d.Size) {
+		return nil, xerrors.Errorf("entry found but size mismatch: %d != %d", size, d.Size)
 	}
 
-	return a.ProofForIndexEntry(idx)
-}
-
-// ProofForIndexEntry gathers information required to produce an InclusionProof based on the index
-// of data within the DataSegment Index.
-func (a Aggregate) ProofForIndexEntry(idx int) (*InclusionProof, error) {
-	e := a.Index.Entry(idx)
-	commLoc := e.CommAndLoc()
-	ip, err := CollectInclusionProof(&a.Tree, a.DealSize, commLoc, idx)
-	if err != nil {
-		return nil, xerrors.Errorf("collecting inclusion proof: %w", err)
-	}
-
-	return ip, nil
+	commLoc := entry.CommAndLoc()
+	return CollectInclusionProof(&a.Tree, a.DealSize, commLoc, idx)
 }
 
 // PieceCID returns the PieceCID of the deal containng all subdeals and the index

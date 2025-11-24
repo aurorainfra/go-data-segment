@@ -101,10 +101,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierDat
 	// inclusion proof verification checks that index is less than the 1<<(path length)
 	dataOffset := ip.ProofSubtree.Index * uint64(veriferData.SizePc)
 
-	en, err := index.MakeDataSegmentIndexEntry((*fr32.Fr32)(&nodeCommPc), dataOffset, uint64(veriferData.SizePc))
-	if err != nil {
-		return nil, xerrors.Errorf("createding data segment index entry: %w", err)
-	}
+	en := index.NewDataSegmentIndexEntry((*fr32.Fr32)(&nodeCommPc), dataOffset, uint64(veriferData.SizePc))
 
 	// In v2, each index entry consists of 4 nodes
 	// We need to compute the Merkle root of these 4 nodes
