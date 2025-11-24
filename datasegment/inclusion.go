@@ -2,6 +2,7 @@ package datasegment
 
 import (
 	"crypto/sha256"
+	"github.com/filecoin-project/go-data-segment/datasegment/index"
 
 	"github.com/filecoin-project/go-data-segment/fr32"
 	"github.com/filecoin-project/go-data-segment/merkletree"
@@ -55,7 +56,7 @@ type InclusionProof struct {
 }
 
 func indexAreaStart(sizePa abi.PaddedPieceSize) uint64 {
-	return uint64(sizePa) - uint64(MaxIndexEntriesInDeal(sizePa))*uint64(EntrySize)
+	return uint64(sizePa) - uint64(index.MaxIndexEntriesInDeal(sizePa))*uint64(index.EntrySizeV2)
 }
 
 func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierData) (*InclusionAuxData, error) {
@@ -100,7 +101,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierDat
 	// inclusion proof verification checks that index is less than the 1<<(path length)
 	dataOffset := ip.ProofSubtree.Index * uint64(veriferData.SizePc)
 
-	en, err := MakeDataSegmentIndexEntry((*fr32.Fr32)(&nodeCommPc), dataOffset, uint64(veriferData.SizePc))
+	en, err := index.MakeDataSegmentIndexEntry((*fr32.Fr32)(&nodeCommPc), dataOffset, uint64(veriferData.SizePc))
 	if err != nil {
 		return nil, xerrors.Errorf("createding data segment index entry: %w", err)
 	}
@@ -150,7 +151,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierDat
 	}
 	if indexOffset < idxStart {
 		return nil, xerrors.Errorf("index entry at wrong position: %d < %d",
-			ip.ProofIndex.Index*uint64(EntrySize), idxStart)
+			ip.ProofIndex.Index*uint64(index.EntrySizeV2), idxStart)
 	}
 
 	cidPa, err := lightCommP2Cid(*assumedCommPa)

@@ -406,7 +406,7 @@ func (t *SingletonMarketSource) UnmarshalCBOR(r io.Reader) (err error) {
 
 var lengthBufSegmentDesc = []byte{132}
 
-func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
+func (t *SegmentDescV2) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
 		return err
@@ -458,8 +458,8 @@ func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
 	return nil
 }
 
-func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
-	*t = SegmentDesc{}
+func (t *SegmentDescV2) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = SegmentDescV2{}
 
 	cr := cbg.NewCborReader(r)
 

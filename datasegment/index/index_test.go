@@ -1,4 +1,4 @@
-package datasegment
+package index
 
 import (
 	"fmt"
@@ -14,39 +14,39 @@ import (
 
 type Node = merkletree.Node
 
-func invalidEntry1() SegmentDesc {
+func invalidEntry1() SegmentDescV2 {
 	// Create an entry with invalid Multicodec (not Raw or CAR) to make it fail validation
 	// but with correct format and checksum for serialization testing
-	entry := SegmentDesc{
+	entry := SegmentDescV2{
 		CommDs:              Node{},
-		Offset:               123,
-		Size:                 12222,
-		RawSize:              12222, // Set RawSize for v2
-		Multicodec:           0x9999, // Invalid multicodec (not Raw or CAR)
-		MulticodecDependent:  Node{},
-		ACLType:              0,
-		ACLData:              0,
-		Reserved:             [7]byte{},
-		Checksum:             [ChecksumSize]byte{},
+		Offset:              123,
+		Size:                12222,
+		RawSize:             12222,  // Set RawSize for v2
+		Multicodec:          0x9999, // Invalid multicodec (not Raw or CAR)
+		MulticodecDependent: Node{},
+		ACLType:             0,
+		ACLData:             0,
+		Reserved:            [7]byte{},
+		Checksum:            [ChecksumSize]byte{},
 	}
 	// Compute correct checksum (with invalid multicodec)
 	entry.Checksum = entry.computeChecksum()
 	return entry
 }
-func invalidEntry2() SegmentDesc {
+func invalidEntry2() SegmentDescV2 {
 	// Create an entry with invalid Multicodec (not Raw or CAR) to make it fail validation
 	// but with correct format and checksum for serialization testing
-	entry := SegmentDesc{
+	entry := SegmentDescV2{
 		CommDs:              Node{},
-		Offset:               311,
-		Size:                 22221,
-		RawSize:              22221, // Set RawSize for v2
-		Multicodec:           0x8888, // Invalid multicodec (not Raw or CAR)
-		MulticodecDependent:  Node{},
-		ACLType:              0,
-		ACLData:              0,
-		Reserved:             [7]byte{},
-		Checksum:             [ChecksumSize]byte{},
+		Offset:              311,
+		Size:                22221,
+		RawSize:             22221,  // Set RawSize for v2
+		Multicodec:          0x8888, // Invalid multicodec (not Raw or CAR)
+		MulticodecDependent: Node{},
+		ACLType:             0,
+		ACLData:             0,
+		Reserved:            [7]byte{},
+		Checksum:            [ChecksumSize]byte{},
 	}
 	// Compute correct checksum (with invalid multicodec)
 	entry.Checksum = entry.computeChecksum()
@@ -57,7 +57,7 @@ func invalidEntry2() SegmentDesc {
 // but have valid v2 format fields and checksums for serialization testing
 func invalidIndex() IndexData {
 	index := IndexData{
-		Entries: []SegmentDesc{invalidEntry1(), invalidEntry2()},
+		Entries: []SegmentDescV2{invalidEntry1(), invalidEntry2()},
 	}
 	return index
 }
@@ -69,24 +69,24 @@ func validIndex(t *testing.T) IndexData {
 	assert.Nil(t, err1)
 	entry2, err2 := MakeDataSegmentIdx(&comm2, 128<<5, 128<<4)
 	assert.Nil(t, err2)
-	index, err3 := MakeIndex([]SegmentDesc{entry1, entry2})
+	index, err3 := MakeIndex([]SegmentDescV2{entry1, entry2})
 	assert.Nil(t, err3)
 	return *index
 }
 
 func TestValidateEntry(t *testing.T) {
 	tests := []struct {
-		sd  SegmentDesc
+		sd  SegmentDescV2
 		err string
 	}{
-		{sd: SegmentDesc{Offset: 0, Size: 0, RawSize: 0, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
-		{sd: SegmentDesc{Offset: 128, Size: 128 * 3249, RawSize: 128 * 3249, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
-		{sd: SegmentDesc{Offset: 128 * 323221, Size: 128 * 3249, RawSize: 128 * 3249, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
+		{sd: SegmentDescV2{Offset: 0, Size: 0, RawSize: 0, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
+		{sd: SegmentDescV2{Offset: 128, Size: 128 * 3249, RawSize: 128 * 3249, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
+		{sd: SegmentDescV2{Offset: 128 * 323221, Size: 128 * 3249, RawSize: 128 * 3249, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
 		// v2: flexible alignment, so offset/size alignment checks are removed
 		// These test cases now pass validation (no alignment errors)
-		{sd: SegmentDesc{Offset: 128*323221 + 1, Size: 128 * 3249, RawSize: 128 * 3249, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
-		{sd: SegmentDesc{Offset: 128 * 323221, Size: 128*3249 + 1, RawSize: 128*3249 + 1, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
-		{sd: SegmentDesc{Offset: 128 * 323221, Size: 128 * 3249, RawSize: 128 * 3249, Multicodec: MulticodecRaw}, err: "checksum"},
+		{sd: SegmentDescV2{Offset: 128*323221 + 1, Size: 128 * 3249, RawSize: 128 * 3249, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
+		{sd: SegmentDescV2{Offset: 128 * 323221, Size: 128*3249 + 1, RawSize: 128*3249 + 1, Multicodec: MulticodecRaw}.withUpdatedChecksum()},
+		{sd: SegmentDescV2{Offset: 128 * 323221, Size: 128 * 3249, RawSize: 128 * 3249, Multicodec: MulticodecRaw}, err: "checksum"},
 	}
 
 	for i, tc := range tests {
@@ -122,7 +122,7 @@ func TestIndexSerialization(t *testing.T) {
 	index := invalidIndex()
 	assert.Equal(t, 2, index.NumEntries())
 	// v2: each entry is 256 bytes (4 nodes * 32 bytes) instead of 128 bytes (2 nodes * 32 bytes)
-	assert.Equal(t, uint64(2*EntrySize), index.IndexSize())
+	assert.Equal(t, uint64(2*EntrySizeV2), index.IndexSize())
 	encoded, err := index.MarshalBinary()
 	assert.NoError(t, err)
 	assert.NotNil(t, encoded)
@@ -187,7 +187,7 @@ func TestNegativeSerialization(t *testing.T) {
 	assert.Nil(t, serialized)
 
 	// Empty entries
-	data = &IndexData{Entries: make([]SegmentDesc, 0)}
+	data = &IndexData{Entries: make([]SegmentDescV2, 0)}
 	serialized, err = SerializeIndex(data)
 	assert.Error(t, err)
 	assert.Nil(t, serialized)
@@ -202,13 +202,13 @@ func TestNegativeSerializationIndexNil(t *testing.T) {
 
 func TestDealSizeSmallerThanSegmentDesciptions(t *testing.T) {
 	// Too small deal
-	en := SegmentDesc{
+	en := SegmentDescV2{
 		CommDs:   Node{},
 		Offset:   123,
 		Size:     12222,
 		Checksum: [ChecksumSize]byte{},
 	}
-	index := IndexData{Entries: []SegmentDesc{en}}
+	index := IndexData{Entries: []SegmentDescV2{en}}
 	assert.Error(t, validateIndexStructure(&index))
 }
 
@@ -219,7 +219,7 @@ func TestNegativeMakeDescWrongSegments(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func MakeIndex(entries []SegmentDesc) (*IndexData, error) {
+func MakeIndex(entries []SegmentDescV2) (*IndexData, error) {
 	index := IndexData{
 		Entries: entries,
 	}

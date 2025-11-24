@@ -1,9 +1,9 @@
-package datasegment
+package index
 
 import (
 	"fmt"
 	"github.com/filecoin-project/go-data-segment/fr32"
-	abi "github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/abi"
 	"golang.org/x/xerrors"
 	"io"
 	"runtime"
@@ -14,7 +14,7 @@ import (
 // of data segment index in unpadded units.
 func DataSegmentIndexStartOffset(dealSize abi.PaddedPieceSize) uint64 {
 	mie := MaxIndexEntriesInDeal(dealSize)
-	fromBack := uint64(mie) * uint64(EntrySize)
+	fromBack := uint64(mie) * uint64(EntrySizeV2)
 	fromBack = fromBack - fromBack/128 // safe because EntrySize = 128 (which is a multiple of 128) and min(MaxIndexEntriesInDeal(x)) = 4
 	return uint64(dealSize.Unpadded()) - fromBack
 }
@@ -70,32 +70,73 @@ func ParseDataSegmentIndex(unpaddedReader io.Reader) (IndexData, error) {
 	// MarshalBinary() returns EntrySize (128 bytes) per entry
 	// IndexReader() unpads the entire block: 128 bytes -> 127 bytes per entry (after Fr32 unpadding)
 	// So we need to pad back to 128 bytes per entry to unmarshal
-	unpaddedEntrySize := (uint64(EntrySize) / 128) * 127 // (128 / 128) * 127 = 1 * 127 = 127 bytes
+	unpaddedEntrySize := (uint64(EntrySizeV2) / 128) * 127 // (128 / 128) * 127 = 1 * 127 = 127 bytes
 	numEntries := uint64(len(unpaddedData)) / unpaddedEntrySize
 
 	// Pre-allocate entries slice to hold all entries (including zero-filled ones)
-	allEntries := make([]SegmentDesc, numEntries)
+	allEntries := make([]SegmentDescV2, numEntries)
+	validEntries := make([]bool, numEntries)
+	validCnt := 0
 
 	for i := uint64(0); i < numEntries; i++ {
 		// Each entry in unpadded format is 127 bytes (1 * 127)
 		// After Fr32 padding, it becomes 128 bytes (1 * 128) = EntrySize
 		// The paddedData already contains the correctly padded entries
-		entryStartPadded := i * EntrySize // Each entry is EntrySize (128) bytes after padding
-		if entryStartPadded+EntrySize > uint64(len(paddedData)) {
+		entryStartPadded := i * EntrySizeV2 // Each entry is EntrySize (128) bytes after padding
+		if entryStartPadded+EntrySizeV2 > uint64(len(paddedData)) {
 			// Not enough padded data, leave as zero value
 			continue
 		}
 
-		entryData := paddedData[entryStartPadded : entryStartPadded+EntrySize]
-
-		// Always try to unmarshal, even if it might be zero-filled
-		// ValidEntries() will filter out invalid ones
+		entryData := paddedData[entryStartPadded : entryStartPadded+EntrySizeV2]
 		if err := allEntries[i].UnmarshalBinary(entryData); err != nil {
-			// If unmarshal fails, leave as zero value
-			// This will be filtered out by ValidEntries()
 			continue
+		}
+		if allEntries[i].Validate() == nil {
+			validEntries[i] = true
+			validCnt++
+		}
+	}
+	if validCnt == 0 {
+		// all entries are invalid, maybe it's v1
+		return parseDataSegmentV1(unpaddedData, paddedData)
+	}
+
+	return IndexData{
+		Entries:      allEntries,
+		ValidEntries: validEntries,
+	}, nil
+}
+
+func parseDataSegmentV1(unpaddedData, paddedData []byte) (IndexData, error) {
+	unpaddedEntrySize := (uint64(EntrySizeV1) / 128) * 127 // (128 / 128) * 127 = 1 * 127 = 127 bytes
+	numEntries := uint64(len(unpaddedData)) / unpaddedEntrySize
+
+	// Pre-allocate entries slice to hold all entries (including zero-filled ones)
+	allEntries := make([]SegmentDescV2, numEntries)
+	validEntries := make([]bool, numEntries)
+
+	emptyEntry := &SegmentDescV1{}
+	for i := uint64(0); i < numEntries; i++ {
+		entryStartPadded := i * EntrySizeV1
+		if entryStartPadded+EntrySizeV2 > uint64(len(paddedData)) {
+			// Not enough padded data, leave as zero value
+			continue
+		}
+
+		entryData := paddedData[entryStartPadded : entryStartPadded+EntrySizeV1]
+
+		if err := emptyEntry.UnmarshalBinary(entryData); err != nil {
+			continue
+		}
+		allEntries[i] = emptyEntry.ToV2()
+		if allEntries[i].Validate() == nil {
+			validEntries[i] = true
 		}
 	}
 
-	return IndexData{Entries: allEntries}, nil
+	return IndexData{
+		Entries:      allEntries,
+		ValidEntries: validEntries,
+	}, nil
 }

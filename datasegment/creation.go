@@ -2,6 +2,7 @@ package datasegment
 
 import (
 	"bytes"
+	"github.com/filecoin-project/go-data-segment/datasegment/index"
 	"io"
 
 	"github.com/hashicorp/go-multierror"
@@ -17,7 +18,7 @@ import (
 
 type Aggregate struct {
 	DealSize abi.PaddedPieceSize
-	Index    PieceIndex
+	Index    index.PieceIndex
 	Tree     merkletree.Hybrid
 }
 
@@ -27,7 +28,7 @@ func NewAggregate(dealSize abi.PaddedPieceSize, subdeals []abi.PieceInfo) (*Aggr
 	if err := dealSize.Validate(); err != nil {
 		return nil, xerrors.Errorf("invalid dealSize: %w", err)
 	}
-	maxEntries := MaxIndexEntriesInDeal(dealSize)
+	maxEntries := index.MaxIndexEntriesInDeal(dealSize)
 	if uint(len(subdeals)) > maxEntries {
 		return nil, xerrors.Errorf("too many subdeals for a %d sized deal: %d > %d",
 			dealSize, len(subdeals), maxEntries)
@@ -37,10 +38,10 @@ func NewAggregate(dealSize abi.PaddedPieceSize, subdeals []abi.PieceInfo) (*Aggr
 		return nil, xerrors.Errorf("computing deal placment: %w", err)
 	}
 
-	if totalSize+uint64(maxEntries)*EntrySize > uint64(dealSize) {
+	if totalSize+uint64(maxEntries)*index.EntrySizeV2 > uint64(dealSize) {
 		return nil, xerrors.Errorf(
 			"sub-deals are too large to fit in the index: %d (packed subdeals) + %d (index) > %d (dealSize)",
-			totalSize, maxEntries*EntrySize, dealSize)
+			totalSize, maxEntries*index.EntrySizeV2, dealSize)
 	}
 
 	ht, err := merkletree.NewHybrid(util.Log2Ceil(uint64(dealSize / merkletree.NodeSize)))
@@ -51,16 +52,17 @@ func NewAggregate(dealSize abi.PaddedPieceSize, subdeals []abi.PieceInfo) (*Aggr
 	if err != nil {
 		return nil, xerrors.Errorf("batch set of deal nodes failed: %w", err)
 	}
-	index := &IndexData{}
-	err = index.InitFromDeals(cl)
+	idx := &index.IndexData{}
+	err = idx.InitFromDeals(cl)
 	if err != nil {
 		return nil, xerrors.Errorf("failed creating index: %w", err)
 	}
 
 	indexStartNodes := indexAreaStart(dealSize) / merkletree.NodeSize
-	batch := make([]merkletree.CommAndLoc, 4*index.NumEntries())
-	for i := 0; i < index.NumEntries(); i++ {
-		e := index.Entry(i)
+	// NewAggregate always uses V2 format (4 nodes per entry)
+	batch := make([]merkletree.CommAndLoc, 4*idx.NumEntries())
+	for i := 0; i < idx.NumEntries(); i++ {
+		e := idx.Entry(i)
 		ns := e.IntoNodes()
 		batch[4*i] = merkletree.CommAndLoc{
 			Comm: ns[0],
@@ -86,7 +88,7 @@ func NewAggregate(dealSize abi.PaddedPieceSize, subdeals []abi.PieceInfo) (*Aggr
 
 	agg := Aggregate{
 		DealSize: dealSize,
-		Index:    index,
+		Index:    idx,
 		Tree:     ht,
 	}
 
@@ -133,9 +135,9 @@ func (a Aggregate) PieceCID() (cid.Cid, error) {
 }
 
 func (a Aggregate) indexLoc() merkletree.Location {
-	level := util.Log2Ceil(EntrySize / merkletree.NodeSize * uint64(MaxIndexEntriesInDeal(a.DealSize)))
-	index := uint64(1)<<(a.Tree.MaxLevel()-level) - 1
-	return merkletree.Location{Level: level, Index: index}
+	level := util.Log2Ceil(index.EntrySizeV2 / merkletree.NodeSize * uint64(index.MaxIndexEntriesInDeal(a.DealSize)))
+	idx := uint64(1)<<(a.Tree.MaxLevel()-level) - 1
+	return merkletree.Location{Level: level, Index: idx}
 }
 
 // IndexPieceCID returns the PieceCID of the index
@@ -164,7 +166,7 @@ func (a Aggregate) IndexReader() (io.Reader, error) {
 	bNoPad := make([]byte, len(b)-len(b)/128)
 	fr32.Unpad(bNoPad, b)
 
-	unpaddedIndexSize := int64(MaxIndexEntriesInDeal(a.DealSize) * EntrySize)
+	unpaddedIndexSize := int64(index.MaxIndexEntriesInDeal(a.DealSize) * index.EntrySizeV2)
 	unpaddedIndexSize = unpaddedIndexSize - unpaddedIndexSize/128
 	paddingSize := unpaddedIndexSize - int64(len(bNoPad))
 
@@ -174,11 +176,11 @@ func (a Aggregate) IndexReader() (io.Reader, error) {
 // IndexStartPosition returns the expected starting position where the index should be placed
 // in the unpadded units
 func (a Aggregate) IndexStartPosition() (uint64, error) {
-	return DataSegmentIndexStartOffset(a.DealSize), nil
+	return index.DataSegmentIndexStartOffset(a.DealSize), nil
 }
 
 func (a Aggregate) IndexSize() (abi.PaddedPieceSize, error) {
-	size := abi.PaddedPieceSize(uint64(MaxIndexEntriesInDeal(a.DealSize)) * EntrySize)
+	size := abi.PaddedPieceSize(uint64(index.MaxIndexEntriesInDeal(a.DealSize)) * index.EntrySizeV2)
 	if err := size.Validate(); err != nil {
 		return abi.PaddedPieceSize(1<<64 - 1), xerrors.Errorf("validating index size %v, report this: %w", size, err)
 	}
