@@ -22,77 +22,84 @@ type Aggregate struct {
 	Tree     merkletree.Hybrid
 }
 
+type PieceInfo struct {
+	Size     uint64
+	PieceCID cid.Cid
+}
+
 // NewAggregate creates the structure for verifiable deal aggregation
 // based on target deal size and subdeals that should be included.
 func NewAggregate(dealSize abi.PaddedPieceSize, subdeals []abi.PieceInfo) (*Aggregate, error) {
 	if err := dealSize.Validate(); err != nil {
 		return nil, xerrors.Errorf("invalid dealSize: %w", err)
 	}
+
 	maxEntries := index.MaxIndexEntriesInDeal(dealSize)
 	if uint(len(subdeals)) > maxEntries {
 		return nil, xerrors.Errorf("too many subdeals for a %d sized deal: %d > %d",
 			dealSize, len(subdeals), maxEntries)
 	}
+
 	cl, totalSize, err := ComputeDealPlacement(subdeals)
 	if err != nil {
 		return nil, xerrors.Errorf("computing deal placment: %w", err)
 	}
 
-	if totalSize+uint64(maxEntries)*index.EntrySizeV2 > uint64(dealSize) {
+	if totalSize+uint64(maxEntries)*index.EntrySize > uint64(dealSize) {
 		return nil, xerrors.Errorf(
 			"sub-deals are too large to fit in the index: %d (packed subdeals) + %d (index) > %d (dealSize)",
-			totalSize, maxEntries*index.EntrySizeV2, dealSize)
+			totalSize, maxEntries*index.EntrySize, dealSize)
 	}
 
 	ht, err := merkletree.NewHybrid(util.Log2Ceil(uint64(dealSize / merkletree.NodeSize)))
 	if err != nil {
 		return nil, xerrors.Errorf("failed creating hybrid tree: %w", err)
 	}
-	err = ht.BatchSet(cl)
-	if err != nil {
+	if err := ht.BatchSet(cl); err != nil {
 		return nil, xerrors.Errorf("batch set of deal nodes failed: %w", err)
 	}
+
+	pieces := make([]*index.SegmentDesc, 0, len(subdeals))
+	var offset uint64
+	for _, deal := range subdeals {
+		comm, err := commcid.CIDToPieceCommitmentV1(deal.PieceCID)
+		if err != nil {
+			return nil, xerrors.Errorf("converting to piece commitment: %w", err)
+		}
+		commP := (*fr32.Fr32)(comm)
+		pieces = append(pieces, index.NewDataSegmentIndexEntry(commP, offset, uint64(deal.Size)))
+		offset += uint64(deal.Size)
+	}
+
 	idx := &index.IndexData{}
-	err = idx.InitFromDeals(cl)
-	if err != nil {
+	if err := idx.InitFromPieces(pieces); err != nil {
 		return nil, xerrors.Errorf("failed creating index: %w", err)
 	}
 
 	indexStartNodes := indexAreaStart(dealSize) / merkletree.NodeSize
-	// NewAggregate always uses V2 format (4 nodes per entry)
-	batch := make([]merkletree.CommAndLoc, 4*idx.NumEntries())
-	for i := 0; i < idx.NumEntries(); i++ {
-		e := idx.Entry(i)
-		ns := e.IntoNodes()
-		batch[4*i] = merkletree.CommAndLoc{
-			Comm: ns[0],
-			Loc:  merkletree.Location{Level: 0, Index: indexStartNodes + 4*uint64(i)},
-		}
-		batch[4*i+1] = merkletree.CommAndLoc{
-			Comm: ns[1],
-			Loc:  merkletree.Location{Level: 0, Index: indexStartNodes + 4*uint64(i) + 1},
-		}
-		batch[4*i+2] = merkletree.CommAndLoc{
-			Comm: ns[2],
-			Loc:  merkletree.Location{Level: 0, Index: indexStartNodes + 4*uint64(i) + 2},
-		}
-		batch[4*i+3] = merkletree.CommAndLoc{
-			Comm: ns[3],
-			Loc:  merkletree.Location{Level: 0, Index: indexStartNodes + 4*uint64(i) + 3},
+	batch := make([]merkletree.CommAndLoc, index.NodesPerEntry*idx.NumPieces())
+	for i := 0; i < idx.NumPieces(); i++ {
+		entry := idx.Entry(i)
+		nodes := entry.IntoNodes()
+		for j := 0; j < index.NodesPerEntry; j++ {
+			batch[index.NodesPerEntry*i+j] = merkletree.CommAndLoc{
+				Comm: nodes[j],
+				Loc: merkletree.Location{
+					Level: 0,
+					Index: indexStartNodes + uint64(index.NodesPerEntry*i+j),
+				},
+			}
 		}
 	}
-	err = ht.BatchSet(batch)
-	if err != nil {
+	if err := ht.BatchSet(batch); err != nil {
 		return nil, xerrors.Errorf("batch set of index nodes failed: %w", err)
 	}
 
-	agg := Aggregate{
+	return &Aggregate{
 		DealSize: dealSize,
 		Index:    idx,
 		Tree:     ht,
-	}
-
-	return &agg, nil
+	}, nil
 }
 
 // ProofForPieceInfo searches for piece within the Aggregate based on PieceInfo and gathers all the
@@ -123,7 +130,7 @@ func (a Aggregate) PieceCID() (cid.Cid, error) {
 }
 
 func (a Aggregate) indexLoc() merkletree.Location {
-	level := util.Log2Ceil(index.EntrySizeV2 / merkletree.NodeSize * uint64(index.MaxIndexEntriesInDeal(a.DealSize)))
+	level := util.Log2Ceil(index.EntrySize / merkletree.NodeSize * uint64(index.MaxIndexEntriesInDeal(a.DealSize)))
 	idx := uint64(1)<<(a.Tree.MaxLevel()-level) - 1
 	return merkletree.Location{Level: level, Index: idx}
 }
@@ -154,7 +161,7 @@ func (a Aggregate) IndexReader() (io.Reader, error) {
 	bNoPad := make([]byte, len(b)-len(b)/128)
 	fr32.Unpad(bNoPad, b)
 
-	unpaddedIndexSize := int64(index.MaxIndexEntriesInDeal(a.DealSize) * index.EntrySizeV2)
+	unpaddedIndexSize := int64(index.MaxIndexEntriesInDeal(a.DealSize) * index.EntrySize)
 	unpaddedIndexSize = unpaddedIndexSize - unpaddedIndexSize/128
 	paddingSize := unpaddedIndexSize - int64(len(bNoPad))
 
@@ -168,7 +175,7 @@ func (a Aggregate) IndexStartPosition() (uint64, error) {
 }
 
 func (a Aggregate) IndexSize() (abi.PaddedPieceSize, error) {
-	size := abi.PaddedPieceSize(uint64(index.MaxIndexEntriesInDeal(a.DealSize)) * index.EntrySizeV2)
+	size := abi.PaddedPieceSize(uint64(index.MaxIndexEntriesInDeal(a.DealSize)) * index.EntrySize)
 	if err := size.Validate(); err != nil {
 		return abi.PaddedPieceSize(1<<64 - 1), xerrors.Errorf("validating index size %v, report this: %w", size, err)
 	}
@@ -180,8 +187,8 @@ func (a Aggregate) IndexSize() (abi.PaddedPieceSize, error) {
 // of the Aggregate.
 // AggregateStreamReader assumes a non-manipulated Index as created by the Aggregate constructor.
 func (a Aggregate) AggregateObjectReader(subPieceReaders []io.Reader) (io.Reader, error) {
-	if len(subPieceReaders) != a.Index.NumEntries() {
-		return nil, xerrors.Errorf("passed different number of subPieceReaders than subPieces: %d != %d", len(subPieceReaders), a.Index.NumEntries())
+	if len(subPieceReaders) != a.Index.NumPieces() {
+		return nil, xerrors.Errorf("passed different number of subPieceReaders than subPieces: %d != %d", len(subPieceReaders), a.Index.NumPieces())
 	}
 	readers := []io.Reader{}
 	add := func(r ...io.Reader) {
@@ -246,7 +253,7 @@ func (a Aggregate) AggregateObjectReader(subPieceReaders []io.Reader) (io.Reader
 	return io.MultiReader(readers...), nil
 }
 
-// ComputeDealPlacement takes in PieceInfos with Comm and NumEntries,
+// ComputeDealPlacement takes in PieceInfos with Comm and NumPieces,
 // computes their placement in the tree and them in form of merkletree.CommAndLoc
 // also returns number of bytes required and any errors
 func ComputeDealPlacement(dealInfos []abi.PieceInfo) ([]merkletree.CommAndLoc, uint64, error) {

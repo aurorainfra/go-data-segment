@@ -3,8 +3,6 @@ package index
 import (
 	"bytes"
 	"encoding"
-	"github.com/filecoin-project/go-data-segment/fr32"
-	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
 	commcid "github.com/filecoin-project/go-fil-commcid"
 	"github.com/filecoin-project/go-state-types/abi"
@@ -26,11 +24,11 @@ func (ve validationError) Is(err error) bool {
 }
 
 type PieceIndex interface {
-	InitFromDeals(dealInfos []merkletree.CommAndLoc) error
-	NumEntries() int
-	Entry(idx int) *SegmentDescV2
+	InitFromPieces(dealInfos []*SegmentDesc) error
+	NumPieces() int
+	Entry(idx int) *SegmentDesc
 	Search(cid cid.Cid) int
-	ListEntries() []*SegmentDescV2
+	ListPieces() []*SegmentDesc
 
 	encoding.BinaryMarshaler
 	encoding.BinaryUnmarshaler
@@ -38,7 +36,7 @@ type PieceIndex interface {
 
 // MaxIndexEntriesInDeal defines the maximum number of index entries in for a given size of a deal
 func MaxIndexEntriesInDeal(dealSize abi.PaddedPieceSize) uint {
-	res := uint(1) << util.Log2Ceil(uint64(dealSize)/2048/uint64(EntrySizeV2))
+	res := uint(1) << util.Log2Ceil(uint64(dealSize)/2048/uint64(EntrySize))
 	if res < NodesPerEntry {
 		return NodesPerEntry
 	}
@@ -46,19 +44,19 @@ func MaxIndexEntriesInDeal(dealSize abi.PaddedPieceSize) uint {
 }
 
 type IndexData struct {
-	Entries  []*SegmentDescV2
+	Entries  []*SegmentDesc
 	validPos []bool
 }
 
 var _ PieceIndex = (*IndexData)(nil)
 
-// InitFromDeals initializes the index from deal information
-func (id *IndexData) InitFromDeals(dealInfos []merkletree.CommAndLoc) error {
-	entries := make([]*SegmentDescV2, 0, len(dealInfos))
-	validPos := make([]bool, len(dealInfos))
-	for i, di := range dealInfos {
-		size := 1 << di.Loc.Level * merkletree.NodeSize
-		sd := NewDataSegmentIndexEntry((*fr32.Fr32)(&di.Comm), di.Loc.LeafIndex()*merkletree.NodeSize, uint64(size))
+// InitFromPieces initializes the index from piece information
+func (id *IndexData) InitFromPieces(pieces []*SegmentDesc) error {
+	entries := make([]*SegmentDesc, 0, len(pieces))
+	validPos := make([]bool, len(pieces))
+	for i := range pieces {
+		sd := &SegmentDesc{}
+		*sd = *pieces[i]
 		entries = append(entries, sd)
 		validPos[i] = true
 	}
@@ -67,13 +65,13 @@ func (id *IndexData) InitFromDeals(dealInfos []merkletree.CommAndLoc) error {
 	return nil
 }
 
-// NumEntries returns the number of entries in the index
-func (id IndexData) NumEntries() int {
+// NumPieces returns the number of entries in the index
+func (id *IndexData) NumPieces() int {
 	return len(id.Entries)
 }
 
 // Entry returns the segment description at the given index
-func (id IndexData) Entry(idx int) *SegmentDescV2 {
+func (id *IndexData) Entry(idx int) *SegmentDesc {
 	if idx < 0 || idx >= len(id.Entries) {
 		return nil
 	}
@@ -82,7 +80,7 @@ func (id IndexData) Entry(idx int) *SegmentDescV2 {
 
 // Search finds the index of a segment by its PieceCID
 // Returns -1 if not found
-func (id IndexData) Search(c cid.Cid) int {
+func (id *IndexData) Search(c cid.Cid) int {
 	comm, err := commcid.CIDToPieceCommitmentV1(c)
 	if err != nil {
 		return -1
@@ -95,8 +93,8 @@ func (id IndexData) Search(c cid.Cid) int {
 	return -1
 }
 
-func (id IndexData) ListEntries() []*SegmentDescV2 {
-	entries := []*SegmentDescV2{}
+func (id *IndexData) ListPieces() []*SegmentDesc {
+	entries := []*SegmentDesc{}
 	for i := range id.Entries {
 		if id.Entries[i] != nil && id.validPos[i] {
 			entries = append(entries, id.Entries[i])
@@ -106,36 +104,36 @@ func (id IndexData) ListEntries() []*SegmentDescV2 {
 }
 
 // IndexSize returns the size of the index. Defined to be number of entries * 64 bytes
-func (i IndexData) IndexSize() uint64 {
-	return uint64(i.NumEntries()) * uint64(EntrySizeV2)
+func (i *IndexData) IndexSize() uint64 {
+	return uint64(i.NumPieces()) * uint64(EntrySize)
 }
 
 var _ encoding.BinaryMarshaler = IndexData{}
 var _ encoding.BinaryUnmarshaler = (*IndexData)(nil)
 
 func (id IndexData) MarshalBinary() (data []byte, err error) {
-	res := make([]byte, EntrySizeV2*len(id.Entries))
+	res := make([]byte, EntrySize*len(id.Entries))
 	for i, r := range id.Entries {
 		if r != nil {
-			r.SerializeFr32Into(res[i*EntrySizeV2 : (i+1)*EntrySizeV2])
+			r.SerializeFr32Into(res[i*EntrySize : (i+1)*EntrySize])
 		}
 	}
 	return res, nil
 }
 
 func (id *IndexData) UnmarshalBinary(data []byte) error {
-	if rem := len(data) % EntrySizeV2; rem != 0 {
-		return xerrors.Errorf("data to unmarshal is not a multiple of EntrySizeV2: %d % %d != 0 (%d)",
-			len(data), EntrySizeV2, rem)
+	if rem := len(data) % EntrySize; rem != 0 {
+		return xerrors.Errorf("data to unmarshal is not a multiple of EntrySize: %d % %d != 0 (%d)",
+			len(data), EntrySize, rem)
 	}
 
 	*id = IndexData{}
-	numEntries := len(data) / EntrySizeV2
-	id.Entries = make([]*SegmentDescV2, numEntries)
+	numEntries := len(data) / EntrySize
+	id.Entries = make([]*SegmentDesc, numEntries)
 	id.validPos = make([]bool, numEntries)
 	for i := 0; i < numEntries; i++ {
-		var entry SegmentDescV2
-		err := entry.UnmarshalBinary(data[i*EntrySizeV2 : (i+1)*EntrySizeV2])
+		var entry SegmentDesc
+		err := entry.UnmarshalBinary(data[i*EntrySize : (i+1)*EntrySize])
 		if err != nil {
 			return xerrors.Errorf("unamrshaling entry at index %d: %w", i, err)
 		}

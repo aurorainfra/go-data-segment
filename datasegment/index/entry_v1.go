@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding"
 	"encoding/binary"
-	"github.com/filecoin-project/go-data-segment/fr32"
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"golang.org/x/xerrors"
 )
@@ -27,11 +26,6 @@ type SegmentDescV1 struct {
 	Size uint64
 	// Checksum is a 126 bit checksum (SHA256) computed on CommDs || Offset || Size
 	Checksum [ChecksumSize]byte
-}
-
-// ToV2 converts a V1 segment description to V2 format
-func (sd SegmentDescV1) ToV2() SegmentDescV2 {
-	return *NewDataSegmentIndexEntry((*fr32.Fr32)(&sd.CommDs), sd.Offset, sd.Size)
 }
 
 var _ encoding.BinaryMarshaler = SegmentDescV1{}

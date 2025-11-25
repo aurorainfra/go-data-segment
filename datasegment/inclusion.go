@@ -56,7 +56,7 @@ type InclusionProof struct {
 }
 
 func indexAreaStart(sizePa abi.PaddedPieceSize) uint64 {
-	return uint64(sizePa) - uint64(index.MaxIndexEntriesInDeal(sizePa))*uint64(index.EntrySizeV2)
+	return uint64(sizePa) - uint64(index.MaxIndexEntriesInDeal(sizePa))*uint64(index.EntrySize)
 }
 
 func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierData) (*InclusionAuxData, error) {
@@ -148,7 +148,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierDat
 	}
 	if indexOffset < idxStart {
 		return nil, xerrors.Errorf("index entry at wrong position: %d < %d",
-			ip.ProofIndex.Index*uint64(index.EntrySizeV2), idxStart)
+			ip.ProofIndex.Index*uint64(index.EntrySize), idxStart)
 	}
 
 	cidPa, err := lightCommP2Cid(*assumedCommPa)

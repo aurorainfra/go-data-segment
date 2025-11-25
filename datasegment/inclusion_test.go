@@ -78,10 +78,10 @@ func TestComputeExpectedAuxData1(t *testing.T) {
 	ht, col := buildDealTree(t, SizePa, sampleSizes1)
 
 	idx := &index.IndexData{}
-	err := idx.InitFromDeals(col)
+	err := idx.InitFromPieces(col)
 	require.NoError(t, err)
 	indexStartNodes := indexAreaStart(SizePa) / merkletree.NodeSize
-	for i := 0; i < idx.NumEntries(); i++ {
+	for i := 0; i < idx.NumPieces(); i++ {
 		e := idx.Entry(i)
 		ns := e.IntoNodes()
 		// v2: each entry consists of 4 nodes

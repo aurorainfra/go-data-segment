@@ -19,6 +19,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func canonicalSegments(entries []*index.SegmentDesc) [][]byte {
+	res := make([][]byte, len(entries))
+	for i, e := range entries {
+		if e == nil {
+			continue
+		}
+		res[i] = e.SerializeFr32()
+	}
+	return res
+}
+
 func samplePieceInfos1() []abi.PieceInfo {
 	res := []abi.PieceInfo{}
 	for i, size := range sampleSizes1 {
@@ -50,24 +61,10 @@ func TestAggregateCreation(t *testing.T) {
 		assert.NoError(t, err)
 		parsedIndex, err := index.ParseDataSegmentIndex(ir)
 		assert.NoError(t, err)
-		parsedValidEntries := parsedIndex.ListEntries()
-		// Convert interface to IndexData to access Entries
-		indexData, ok := a.Index.(*index.IndexData)
-		require.True(t, ok, "Index should be *index.IndexData")
-		// Convert both pointer slices to value slices for comparison
-		indexEntries := make([]index.SegmentDescV2, len(indexData.Entries))
-		for i, e := range indexData.Entries {
-			if e != nil {
-				indexEntries[i] = *e
-			}
-		}
-		parsedEntries := make([]index.SegmentDescV2, len(parsedValidEntries))
-		for i, e := range parsedValidEntries {
-			if e != nil {
-				parsedEntries[i] = *e
-			}
-		}
-		assert.Equal(t, indexEntries, parsedEntries)
+		parsedValidEntries := parsedIndex.ListPieces()
+		assert.Equal(t,
+			canonicalSegments(a.Index.ListPieces()),
+			canonicalSegments(parsedValidEntries))
 	})
 
 	for _, pi := range subPieceInfos {
@@ -301,27 +298,16 @@ func TestAggregateSample(t *testing.T) {
 
 		parsedIndexData, err := index.ParseDataSegmentIndex(f)
 		require.NoError(t, err)
-		// Convert interface to IndexData to access valid
-		indexData, ok := a.Index.(*index.IndexData)
-		require.True(t, ok, "Index should be *index.IndexData")
-		// Compare the actual entries, not the pointer slices
-		indexEntries := indexData.ListEntries()
-		parsedEntries := parsedIndexData.ListEntries()
-		require.Equal(t, len(indexEntries), len(parsedEntries))
-		for i := range indexEntries {
-			assert.Equal(t, *indexEntries[i], *parsedEntries[i])
-		}
+		assert.Equal(t,
+			canonicalSegments(a.Index.ListPieces()),
+			canonicalSegments(parsedIndexData.ListPieces()))
 	}
 	indexJson, err := os.Create("testdata/sample_aggregate/index.json")
 	require.NoError(t, err)
-	// Convert interface to IndexData to access valid
-	indexData, ok := a.Index.(*index.IndexData)
-	require.True(t, ok, "Index should be *index.IndexData")
-	entries := indexData.ListEntries()
 
 	enc := json.NewEncoder(indexJson)
 	enc.SetIndent("", "  ")
-	err = enc.Encode(entries)
+	err = enc.Encode(a.Index.ListPieces())
 	assert.NoError(t, err)
 	indexJson.Close()
 

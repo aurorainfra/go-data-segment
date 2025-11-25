@@ -9,6 +9,7 @@ import (
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
 	commcid "github.com/filecoin-project/go-fil-commcid"
+	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
@@ -17,10 +18,10 @@ import (
 
 const NodesPerEntry = 4
 
-// EntrySizeV2 is the size of a Data Segment Index Entry v2
+// EntrySize is the size of a Data Segment Index Entry v2
 // v2 entries consist of 4 Merkle nodes (4 * 32 = 128 bytes)
 // This is the serialized size in memory (padded format, aligned to 128-byte boundaries).
-const EntrySizeV2 = NodesPerEntry * merkletree.NodeSize // 128 bytes (4 nodes of 32 bytes each)
+const EntrySize = NodesPerEntry * merkletree.NodeSize // 128 bytes (4 nodes of 32 bytes each)
 
 // Multicodec values
 const (
@@ -28,9 +29,9 @@ const (
 	MulticodecCAR = 0x0202 // CAR format (IPLD)
 )
 
-// SegmentDescV2 contains a data segment description (v2 format)
+// SegmentDesc contains a data segment description (v2 format)
 // to be contained as four Fr32 elements in 4 leaf nodes of the data segment index
-type SegmentDescV2 struct {
+type SegmentDesc struct {
 	CommDs merkletree.Node
 	Offset uint64
 
@@ -46,7 +47,7 @@ type SegmentDescV2 struct {
 }
 
 // PieceCID returns the PieceCID of the sub-deal
-func (sd SegmentDescV2) PieceCID() cid.Cid {
+func (sd SegmentDesc) PieceCID() cid.Cid {
 	c, err := commcid.PieceCommitmentV1ToCID(sd.CommDs[:])
 	if err != nil {
 		panic("CommDs is always 32 bytes: " + err.Error())
@@ -55,12 +56,12 @@ func (sd SegmentDescV2) PieceCID() cid.Cid {
 }
 
 // UnpaddedOffest returns unpadded offset of the sub-deal relative to the deal start
-func (sd SegmentDescV2) UnpaddedOffest() uint64 {
+func (sd SegmentDesc) UnpaddedOffest() uint64 {
 	return sd.Offset - sd.Offset/128
 }
 
 // UnpaddedLength returns unpadded length of the sub-deal
-func (sd SegmentDescV2) UnpaddedLength() uint64 {
+func (sd SegmentDesc) UnpaddedLength() uint64 {
 	size := sd.Size()
 	return size - size/128
 }
@@ -71,7 +72,7 @@ func pieceSize2Height(size uint64) uint8 {
 	return uint8(util.Log2Ceil(leafCnt))
 }
 
-func (sd SegmentDescV2) CommAndLoc() merkletree.CommAndLoc {
+func (sd SegmentDesc) CommAndLoc() merkletree.CommAndLoc {
 	lvl := util.Log2Ceil(sd.Size() / merkletree.NodeSize)
 	res := merkletree.CommAndLoc{
 		Comm: sd.CommDs,
@@ -83,32 +84,34 @@ func (sd SegmentDescV2) CommAndLoc() merkletree.CommAndLoc {
 	return res
 }
 
-func (sd *SegmentDescV2) Size() uint64 {
+func (sd *SegmentDesc) Size() uint64 {
 	if sd.Height == 0 {
 		return sd.RawSize
 	}
 	return uint64(merkletree.NodeSize) << sd.Height
 }
 
-// create a new SegmentDescV2
-// the size should be a pre-fr32-padding one containing tail null paddings
-func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, size uint64) *SegmentDescV2 {
-	height := pieceSize2Height(size)
-	return (&SegmentDescV2{
-		CommDs:              *(*merkletree.Node)(CommP),
-		Offset:              offset,
-		Height:              height,
-		RawSize:             size, // TODO
-		Multicodec:          MulticodecRaw,
-		MulticodecDependent: merkletree.Node{},
-		ACLType:             0,
-		ACLData:             0,
-		Reserved:            [14]byte{},
-		Checksum:            [ChecksumSize]byte{},
-	}).withUpdatedChecksum()
+func NewDataSegmentDescFromV1(sd *SegmentDescV1) *SegmentDesc {
+	return NewDataSegmentIndexEntry((*fr32.Fr32)(&sd.CommDs), sd.Offset, sd.Size).WithUpdatedChecksum()
 }
 
-func (sd *SegmentDescV2) computeChecksum() [ChecksumSize]byte {
+// create a new SegmentDesc
+// the size should be a pre-fr32-padding one containing tail null paddings
+func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, size uint64) *SegmentDesc {
+	var height uint8
+	if abi.PaddedPieceSize(size).Validate() == nil {
+		height = pieceSize2Height(size)
+	}
+	return &SegmentDesc{
+		CommDs:     *(*merkletree.Node)(CommP),
+		Offset:     offset,
+		Height:     height,
+		RawSize:    size,
+		Multicodec: MulticodecRaw,
+	}
+}
+
+func (sd *SegmentDesc) computeChecksum() [ChecksumSize]byte {
 	sdCopy := sd
 	sdCopy.Checksum = [ChecksumSize]byte{}
 
@@ -120,25 +123,25 @@ func (sd *SegmentDescV2) computeChecksum() [ChecksumSize]byte {
 	return *(*[ChecksumSize]byte)(res)
 }
 
-func (sd *SegmentDescV2) withUpdatedChecksum() *SegmentDescV2 {
+func (sd *SegmentDesc) WithUpdatedChecksum() *SegmentDesc {
 	sd.Checksum = sd.computeChecksum()
 	return sd
 }
 
-var _ encoding.BinaryMarshaler = &SegmentDescV2{}
-var _ encoding.BinaryUnmarshaler = (*SegmentDescV2)(nil)
+var _ encoding.BinaryMarshaler = &SegmentDesc{}
+var _ encoding.BinaryUnmarshaler = (*SegmentDesc)(nil)
 
-func (sd *SegmentDescV2) MarshalBinary() ([]byte, error) {
+func (sd *SegmentDesc) MarshalBinary() ([]byte, error) {
 	return sd.SerializeFr32(), nil
 }
 
-func (sd *SegmentDescV2) UnmarshalBinary(data []byte) error {
-	if len(data) != EntrySizeV2 {
-		return xerrors.Errorf("invalid segment description size: expected %d, got %d", EntrySizeV2, len(data))
+func (sd *SegmentDesc) UnmarshalBinary(data []byte) error {
+	if len(data) != EntrySize {
+		return xerrors.Errorf("invalid segment description size: expected %d, got %d", EntrySize, len(data))
 	}
 	le := binary.LittleEndian
 
-	*sd = SegmentDescV2{}
+	*sd = SegmentDesc{}
 	// Node 1: CommDS (32 bytes)
 	sd.CommDs = *(*merkletree.Node)(data[:merkletree.NodeSize])
 
@@ -174,16 +177,16 @@ func (sd *SegmentDescV2) UnmarshalBinary(data []byte) error {
 	return nil
 }
 
-func (sd *SegmentDescV2) SerializeFr32() []byte {
-	res := make([]byte, EntrySizeV2)
+func (sd *SegmentDesc) SerializeFr32() []byte {
+	res := make([]byte, EntrySize)
 	sd.SerializeFr32Into(res)
 	return res
 }
 
 // SerializeFr32Into serializes the Segment Desctipion into given slice
-// Panics if len(slice) < EntrySizeV2
-func (sd *SegmentDescV2) SerializeFr32Into(slice []byte) {
-	_ = slice[EntrySizeV2-1]
+// Panics if len(slice) < EntrySize
+func (sd *SegmentDesc) SerializeFr32Into(slice []byte) {
+	_ = slice[EntrySize-1]
 
 	le := binary.LittleEndian
 	offset := 0
@@ -218,9 +221,9 @@ func (sd *SegmentDescV2) SerializeFr32Into(slice []byte) {
 	copy(slice[offset:], sd.Checksum[:])
 }
 
-// IntoNodes converts the SegmentDescV2 directly into 4 Merkle nodes without intermediate allocation
+// IntoNodes converts the SegmentDesc directly into 4 Merkle nodes without intermediate allocation
 // This avoids the overhead of SerializeFr32() which allocates a 256-byte buffer
-func (sd *SegmentDescV2) IntoNodes() [4]merkletree.Node {
+func (sd *SegmentDesc) IntoNodes() [4]merkletree.Node {
 	var nodes [NodesPerEntry]merkletree.Node
 	le := binary.LittleEndian
 
@@ -249,7 +252,19 @@ func (sd *SegmentDescV2) IntoNodes() [4]merkletree.Node {
 	return nodes
 }
 
-func (sd *SegmentDescV2) Validate() error {
+func (sd *SegmentDesc) WithCodec(codec uint64, codecDependent merkletree.Node) *SegmentDesc {
+	sd.Multicodec = codec
+	sd.MulticodecDependent = codecDependent
+	return sd
+}
+
+func (sd *SegmentDesc) WithACL(t uint8, data uint64) *SegmentDesc {
+	sd.ACLType = t
+	sd.ACLData = data
+	return sd
+}
+
+func (sd *SegmentDesc) Validate() error {
 	// Validate checksum
 	if sd.computeChecksum() != sd.Checksum {
 		return validationError("computed checksum does not match embedded checksum")
@@ -286,7 +301,7 @@ func (sd *SegmentDescV2) Validate() error {
 		}
 	}
 
-	// Note: Offset and NumEntries alignment checks removed for v2 as flexible alignment is allowed
+	// Note: Offset and NumPieces alignment checks removed for v2 as flexible alignment is allowed
 	// The specification recommends 127-byte alignment but allows arbitrary alignment
 
 	return nil
@@ -296,7 +311,7 @@ func (sd *SegmentDescV2) Validate() error {
 
 var lengthBufSegmentDesc = []byte{133}
 
-func (t *SegmentDescV2) MarshalCBOR(w io.Writer) error {
+func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
 		return err
@@ -338,8 +353,8 @@ func (t *SegmentDescV2) MarshalCBOR(w io.Writer) error {
 	return nil
 }
 
-func (t *SegmentDescV2) UnmarshalCBOR(r io.Reader) (err error) {
-	*t = SegmentDescV2{}
+func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = SegmentDesc{}
 
 	cr := cbg.NewCborReader(r)
 
