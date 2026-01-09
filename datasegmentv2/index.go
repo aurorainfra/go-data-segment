@@ -1,4 +1,4 @@
-package index
+package datasegmentv2
 
 import (
 	"bytes"
@@ -8,6 +8,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
+	"io"
 )
 
 type validationError string
@@ -43,35 +44,35 @@ func MaxIndexEntriesInDeal(dealSize abi.PaddedPieceSize) uint {
 	return res
 }
 
-type IndexData struct {
-	Entries  []*SegmentDesc
-	validPos []bool
+type IndexDataV2 struct {
+	Entries []*SegmentDesc
 }
 
-var _ PieceIndex = (*IndexData)(nil)
+var _ PieceIndex = (*IndexDataV2)(nil)
+
+func NewIndexFromPieces(data []io.Reader, offsets []int64, lens []int64) (*IndexDataV2, error) {
+	return nil, nil
+}
 
 // InitFromPieces initializes the index from piece information
-func (id *IndexData) InitFromPieces(pieces []*SegmentDesc) error {
+func (id *IndexDataV2) InitFromPieces(pieces []*SegmentDesc) error {
 	entries := make([]*SegmentDesc, 0, len(pieces))
-	validPos := make([]bool, len(pieces))
 	for i := range pieces {
 		sd := &SegmentDesc{}
 		*sd = *pieces[i]
 		entries = append(entries, sd)
-		validPos[i] = true
 	}
 	id.Entries = entries
-	id.validPos = validPos
 	return nil
 }
 
 // NumPieces returns the number of entries in the index
-func (id *IndexData) NumPieces() int {
+func (id *IndexDataV2) NumPieces() int {
 	return len(id.Entries)
 }
 
 // Entry returns the segment description at the given index
-func (id *IndexData) Entry(idx int) *SegmentDesc {
+func (id *IndexDataV2) Entry(idx int) *SegmentDesc {
 	if idx < 0 || idx >= len(id.Entries) {
 		return nil
 	}
@@ -80,7 +81,7 @@ func (id *IndexData) Entry(idx int) *SegmentDesc {
 
 // Search finds the index of a segment by its PieceCID
 // Returns -1 if not found
-func (id *IndexData) Search(c cid.Cid) int {
+func (id *IndexDataV2) Search(c cid.Cid) int {
 	comm, err := commcid.CIDToPieceCommitmentV1(c)
 	if err != nil {
 		return -1
@@ -93,10 +94,10 @@ func (id *IndexData) Search(c cid.Cid) int {
 	return -1
 }
 
-func (id *IndexData) ListPieces() []*SegmentDesc {
+func (id *IndexDataV2) ListPieces() []*SegmentDesc {
 	entries := []*SegmentDesc{}
 	for i := range id.Entries {
-		if id.Entries[i] != nil && id.validPos[i] {
+		if id.Entries[i] != nil {
 			entries = append(entries, id.Entries[i])
 		}
 	}
@@ -104,14 +105,14 @@ func (id *IndexData) ListPieces() []*SegmentDesc {
 }
 
 // IndexSize returns the size of the index. Defined to be number of entries * 64 bytes
-func (i *IndexData) IndexSize() uint64 {
+func (i *IndexDataV2) IndexSize() uint64 {
 	return uint64(i.NumPieces()) * uint64(EntrySize)
 }
 
-var _ encoding.BinaryMarshaler = IndexData{}
-var _ encoding.BinaryUnmarshaler = (*IndexData)(nil)
+var _ encoding.BinaryMarshaler = IndexDataV2{}
+var _ encoding.BinaryUnmarshaler = (*IndexDataV2)(nil)
 
-func (id IndexData) MarshalBinary() (data []byte, err error) {
+func (id IndexDataV2) MarshalBinary() (data []byte, err error) {
 	res := make([]byte, EntrySize*len(id.Entries))
 	for i, r := range id.Entries {
 		if r != nil {
@@ -121,16 +122,15 @@ func (id IndexData) MarshalBinary() (data []byte, err error) {
 	return res, nil
 }
 
-func (id *IndexData) UnmarshalBinary(data []byte) error {
+func (id *IndexDataV2) UnmarshalBinary(data []byte) error {
 	if rem := len(data) % EntrySize; rem != 0 {
 		return xerrors.Errorf("data to unmarshal is not a multiple of EntrySize: %d % %d != 0 (%d)",
 			len(data), EntrySize, rem)
 	}
 
-	*id = IndexData{}
+	*id = IndexDataV2{}
 	numEntries := len(data) / EntrySize
 	id.Entries = make([]*SegmentDesc, numEntries)
-	id.validPos = make([]bool, numEntries)
 	for i := 0; i < numEntries; i++ {
 		var entry SegmentDesc
 		err := entry.UnmarshalBinary(data[i*EntrySize : (i+1)*EntrySize])
@@ -138,7 +138,6 @@ func (id *IndexData) UnmarshalBinary(data []byte) error {
 			return xerrors.Errorf("unamrshaling entry at index %d: %w", i, err)
 		}
 		id.Entries[i] = &entry
-		id.validPos[i] = true
 	}
 	return nil
 }

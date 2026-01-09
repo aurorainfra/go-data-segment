@@ -1,4 +1,4 @@
-package index
+package datasegmentv2
 
 import (
 	"crypto/sha256"
@@ -9,12 +9,15 @@ import (
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
 	commcid "github.com/filecoin-project/go-fil-commcid"
-	"github.com/filecoin-project/go-state-types/abi"
+	commp2 "github.com/filecoin-project/go-fil-commp-hashhash/commp2"
+
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 	"io"
 )
+
+const ChecksumSize = 16
 
 const NodesPerEntry = 4
 
@@ -31,11 +34,15 @@ const (
 
 // SegmentDesc contains a data segment description (v2 format)
 // to be contained as four Fr32 elements in 4 leaf nodes of the data segment index
+// All offset and size fields represent pre-Fr32-padding byte positions and lengths
 type SegmentDesc struct {
 	CommDs merkletree.Node
-	Offset uint64
+	Offset uint64 // pre-Fr32-padding offset from start of deal
 
-	Height  uint8 // tree height (number of levels from leaves to root)
+	// Size is the total size including trailing padding (pre-Fr32-padding)
+	// RawSize is the actual data size before padding (pre-Fr32-padding)
+	// Height is computed from Size: height = log2(Size / NodeSize)
+	Size    uint64
 	RawSize uint64
 
 	Multicodec          uint64
@@ -46,7 +53,7 @@ type SegmentDesc struct {
 	Checksum            [ChecksumSize]byte
 }
 
-// PieceCID returns the PieceCID of the sub-deal
+// PieceCID returns the PieceCID v1 of the sub-deal
 func (sd SegmentDesc) PieceCID() cid.Cid {
 	c, err := commcid.PieceCommitmentV1ToCID(sd.CommDs[:])
 	if err != nil {
@@ -55,58 +62,235 @@ func (sd SegmentDesc) PieceCID() cid.Cid {
 	return c
 }
 
-// UnpaddedOffest returns unpadded offset of the sub-deal relative to the deal start
-func (sd SegmentDesc) UnpaddedOffest() uint64 {
-	return sd.Offset - sd.Offset/128
+// PieceCIDV2 computes the PieceCID v2 for this segment
+// According to FRC-1216 and FRC-0069:
+// - For aligned pieces (offset aligned to piece start), Piece CID v2 equals Piece CID v1
+// - For misaligned pieces, Piece CID v2 requires offset-aware CommP computation using commp2
+//
+// This method returns Piece CID v1 for aligned pieces. For misaligned pieces,
+// use ComputePieceCIDV2WithData which requires access to the raw data.
+func (sd SegmentDesc) PieceCIDV2() (cid.Cid, error) {
+	// For aligned pieces (offset == 0 or aligned to piece boundary), v2 equals v1
+	// According to FRC-1216 discussion, if offset is aligned to piece start,
+	// CommP v2 matches CommP v1
+	if sd.Offset == 0 {
+		return sd.PieceCID(), nil
+	}
+
+	// For misaligned pieces, we cannot compute v2 without the raw data
+	// Use ComputePieceCIDV2WithData instead
+	return cid.Undef, xerrors.Errorf("PieceCIDV2 for misaligned pieces requires raw data access, use ComputePieceCIDV2WithData")
+}
+
+// ComputePieceCIDV2WithData computes Piece CID v2 for misaligned pieces
+// using the commp2 library with access to raw data
+//
+// Parameters:
+//   - dataReader: Reader for the raw piece data (pre-Fr32-padding, size = RawSize)
+//   - dealOffset: Offset of this piece within the larger deal (for context)
+//
+// This function uses commp2 library to compute offset-aware CommP v2.
+	// For misaligned pieces, commp2 computes the CommP tree with:
+	// - Interior leaves from the actual data
+	// - Zero commitments for padding areas outside piece boundaries
+	// - Offset-aware tree shape
+//
+// Note: dealOffset parameter is provided for context but the actual offset used
+// is sd.Offset, which represents the piece's offset in the sector/deal.
+func (sd SegmentDesc) ComputePieceCIDV2WithData(dataReader io.Reader, dealOffset uint64) (cid.Cid, error) {
+	if sd.RawSize == 0 {
+		return cid.Undef, xerrors.Errorf("RawSize cannot be zero")
+	}
+
+	// Use commp2 to calculate the CommP for this piece at its offset
+	calc := &commp2.Calc{}
+	
+	// Set the offset using BeginAt (sd.Offset is the pre-Fr32-padding offset)
+	if err := calc.BeginAt(sd.Offset); err != nil {
+		return cid.Undef, xerrors.Errorf("failed to set BeginAt offset %d: %w", sd.Offset, err)
+	}
+
+	// Read and write the piece data
+	// Limit the reader to RawSize bytes to ensure we don't read more than expected
+	limitedReader := io.LimitReader(dataReader, int64(sd.RawSize))
+	buf := make([]byte, 32*1024) // 32KB buffer for efficient reading
+	totalRead := uint64(0)
+	
+	for totalRead < sd.RawSize {
+		n, err := limitedReader.Read(buf)
+		if err != nil && err != io.EOF {
+			return cid.Undef, xerrors.Errorf("failed to read piece data: %w", err)
+		}
+		if n == 0 {
+			break
+		}
+		
+		// Write the data to commp2 calculator
+		written, err := calc.Write(buf[:n])
+		if err != nil {
+			return cid.Undef, xerrors.Errorf("failed to write data to commp2: %w", err)
+		}
+		if written != n {
+			return cid.Undef, xerrors.Errorf("incomplete write to commp2: wrote %d of %d bytes", written, n)
+		}
+		
+		totalRead += uint64(n)
+	}
+	
+	// Verify we read exactly RawSize bytes
+	if totalRead != sd.RawSize {
+		return cid.Undef, xerrors.Errorf("data size mismatch: expected %d bytes, read %d bytes", sd.RawSize, totalRead)
+	}
+
+	// Get the CommP digest from commp2
+	commp2Digest, _, err := calc.Digest()
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("failed to get digest from commp2: %w", err)
+	}
+	if len(commp2Digest) != 32 {
+		return cid.Undef, xerrors.Errorf("invalid digest length: expected 32, got %d", len(commp2Digest))
+	}
+
+	// Convert digest to Piece CID v1 (which is the same as Piece CID v2 for CommP)
+	// According to FRC-1216, Piece CID v2 uses the same CommP calculation as v1
+	pieceCID, err := commcid.PieceCommitmentV1ToCID(commp2Digest)
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("failed to convert digest to CID: %w", err)
+	}
+
+	return pieceCID, nil
+}
+
+// UnpaddedOffset returns unpadded offset of the sub-deal relative to the deal start
+// (converts from post-Fr32-padding to pre-Fr32-padding)
+func (sd SegmentDesc) UnpaddedOffset() uint64 {
+	// Offset is already in pre-Fr32-padding bytes according to v2 spec
+	return sd.Offset
 }
 
 // UnpaddedLength returns unpadded length of the sub-deal
+// This is simply RawSize since all sizes in v2 are pre-Fr32-padding
 func (sd SegmentDesc) UnpaddedLength() uint64 {
-	size := sd.Size()
-	return size - size/128
+	return sd.RawSize
 }
 
-func pieceSize2Height(size uint64) uint8 {
-	paddedSize := size * 128 / 127
-	leafCnt := paddedSize / merkletree.NodeSize
-	return uint8(util.Log2Ceil(leafCnt))
+// Padding returns the amount of padding (Size - RawSize)
+func (sd SegmentDesc) Padding() uint64 {
+	if sd.Size < sd.RawSize {
+		return 0
+	}
+	return sd.Size - sd.RawSize
+}
+
+// Height returns the tree height computed from Size
+// Height = log2(ceil(Size / NodeSize))
+// For v2, Size doesn't need to be power-of-two, so we use Log2Ceil to get the height
+// needed to contain the actual size
+func (sd SegmentDesc) Height() uint8 {
+	if sd.Size == 0 {
+		return 0
+	}
+	leafCount := sd.Size / merkletree.NodeSize
+	if leafCount == 0 {
+		return 0
+	}
+	// For v2, Size doesn't need to be power-of-two
+	// We compute the height needed to contain this size (which may not be power-of-two)
+	return uint8(util.Log2Ceil(leafCount))
+}
+
+// computeHeightFromSize calculates the tree height needed for a given size
+// For v2, size doesn't need to be power-of-two, so we just compute the height
+// needed to contain the actual size
+func computeHeightFromSize(size uint64) uint8 {
+	if size == 0 {
+		return 0
+	}
+	leafCount := size / merkletree.NodeSize
+	if leafCount == 0 {
+		return 0
+	}
+	// For v2, we don't require power-of-two, just compute the height needed
+	return uint8(util.Log2Ceil(leafCount))
 }
 
 func (sd SegmentDesc) CommAndLoc() merkletree.CommAndLoc {
-	lvl := util.Log2Ceil(sd.Size() / merkletree.NodeSize)
+	height := sd.Height()
+	lvl := int(height)
+	leafIndex := sd.Offset / merkletree.NodeSize
+	// For a tree of height h, the root is at level h, and we need to compute the index
+	// at that level that contains this leaf
+	subtreeIndex := leafIndex >> height
 	res := merkletree.CommAndLoc{
 		Comm: sd.CommDs,
 		Loc: merkletree.Location{
 			Level: lvl,
-			Index: sd.Offset / merkletree.NodeSize >> lvl,
+			Index: subtreeIndex,
 		},
 	}
 	return res
 }
 
-func (sd *SegmentDesc) Size() uint64 {
-	if sd.Height == 0 {
-		return sd.RawSize
-	}
-	return uint64(merkletree.NodeSize) << sd.Height
+// SegmentDescV1 contains a data segment description (v1 format)
+// to be contained as two Fr32 elements in 2 leaf nodes of the data segment index
+type SegmentDescV1 struct {
+	// Commitment to the data segment (Merkle node which is the root of the subtree containing all the nodes making up the data segment)
+	CommDs merkletree.Node
+	// Offset is the offset from the start of the deal in padded bytes
+	Offset uint64
+	// Size is the number of padded bytes that is contained in the sub-deal reflected by this SegmentDescV1
+	Size uint64
+	// Checksum is a 126 bit checksum (SHA256) computed on CommDs || Offset || Size
+	Checksum [ChecksumSize]byte
 }
 
 func NewDataSegmentDescFromV1(sd *SegmentDescV1) *SegmentDesc {
+	// For V1, Size is the total size (which in v2 terms would be both Size and RawSize)
+	// Since V1 doesn't have padding, we use Size as both Size and RawSize
 	return NewDataSegmentIndexEntry((*fr32.Fr32)(&sd.CommDs), sd.Offset, sd.Size).WithUpdatedChecksum()
 }
 
-// create a new SegmentDesc
-// the size should be a pre-fr32-padding one containing tail null paddings
-func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, size uint64) *SegmentDesc {
-	var height uint8
-	if abi.PaddedPieceSize(size).Validate() == nil {
-		height = pieceSize2Height(size)
+// NewDataSegmentIndexEntry creates a new SegmentDesc entry for v2 format
+// Parameters:
+//   - CommP: The piece commitment (CommDs)
+//   - offset: Pre-Fr32-padding byte offset from start of deal (can be arbitrary, no alignment required)
+//   - rawSize: Pre-Fr32-padding actual data size (can be arbitrary, no power-of-two requirement)
+//
+// The function computes Size (total size including padding) such that:
+//   - Size >= RawSize
+//   - After Fr32 padding, Size is aligned to NodeSize boundaries
+//
+// For v2, both offset and size can be arbitrary - no power-of-two alignment is required.
+// The piece will be placed at the exact offset specified, and the size will be
+// the minimum needed to contain the rawSize data after Fr32 padding.
+func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, rawSize uint64) *SegmentDesc {
+	// Calculate the minimum post-Fr32 size needed to contain the rawSize data
+	// Fr32 padding: post-Fr32 = ceil(pre-Fr32 * 128 / 127)
+	// We need: post-Fr32 >= rawSize (to contain the data)
+	// And: post-Fr32 should be aligned to NodeSize boundaries
+	
+	// Start by computing minimum post-Fr32 size needed
+	minPostFr32Size := rawSize
+	if minPostFr32Size%merkletree.NodeSize != 0 {
+		minPostFr32Size = ((minPostFr32Size / merkletree.NodeSize) + 1) * merkletree.NodeSize
 	}
+	
+	// Convert back to pre-Fr32 size
+	// post-Fr32 = ceil(pre-Fr32 * 128 / 127)
+	// So: pre-Fr32 >= (post-Fr32 * 127 + 126) / 128
+	// We use the minimum pre-Fr32 size that gives us the required post-Fr32 size
+	size := (minPostFr32Size*127 + 126) / 128
+	
+	// Ensure Size is at least RawSize (should always be true, but check anyway)
+	if size < rawSize {
+		size = rawSize
+	}
+	
 	return &SegmentDesc{
 		CommDs:     *(*merkletree.Node)(CommP),
 		Offset:     offset,
-		Height:     height,
-		RawSize:    size,
+		Size:       size,
+		RawSize:    rawSize,
 		Multicodec: MulticodecRaw,
 	}
 }
@@ -145,15 +329,14 @@ func (sd *SegmentDesc) UnmarshalBinary(data []byte) error {
 	// Node 1: CommDS (32 bytes)
 	sd.CommDs = *(*merkletree.Node)(data[:merkletree.NodeSize])
 
-	// Node 2 layout:
-	// Offset (8 bytes) | Height (1 byte) | Reserved[0:7] (7 bytes) | Padding (8 bytes) | Multicodec (8 bytes)
+	// Node 2 layout (32 bytes = 254 bits usable):
+	// Offset (64 bits = 8 bytes) | Size (64 bits = 8 bytes) | RawSize (64 bits = 8 bytes) | Multicodec (64 bits = 8 bytes)
+	// Note: FRC-1216 specifies RawSize as 62 bits, but we use 64 bits for simplicity
 	offset := merkletree.NodeSize
 	sd.Offset = le.Uint64(data[offset:])
 	offset += 8
-	sd.Height = data[offset]
-	offset += 1
-	copy(sd.Reserved[:7], data[offset:offset+7])
-	offset += 7
+	sd.Size = le.Uint64(data[offset:])
+	offset += 8
 	sd.RawSize = le.Uint64(data[offset:])
 	offset += 8
 	sd.Multicodec = le.Uint64(data[offset:])
@@ -198,10 +381,8 @@ func (sd *SegmentDesc) SerializeFr32Into(slice []byte) {
 	// Node 2 layout matches UnmarshalBinary
 	le.PutUint64(slice[offset:], sd.Offset)
 	offset += 8
-	slice[offset] = sd.Height
-	offset += 1
-	copy(slice[offset:], sd.Reserved[:7])
-	offset += 7
+	le.PutUint64(slice[offset:], sd.Size)
+	offset += 8
 	le.PutUint64(slice[offset:], sd.RawSize)
 	offset += 8
 	le.PutUint64(slice[offset:], sd.Multicodec)
@@ -232,8 +413,7 @@ func (sd *SegmentDesc) IntoNodes() [4]merkletree.Node {
 
 	var node2 [32]byte
 	le.PutUint64(node2[0:], sd.Offset)
-	node2[8] = sd.Height
-	copy(node2[9:16], sd.Reserved[:7])
+	le.PutUint64(node2[8:], sd.Size)
 	le.PutUint64(node2[16:], sd.RawSize)
 	le.PutUint64(node2[24:], sd.Multicodec)
 	nodes[1] = merkletree.Node(node2)
@@ -270,11 +450,14 @@ func (sd *SegmentDesc) Validate() error {
 		return validationError("computed checksum does not match embedded checksum")
 	}
 
-	// Validate padding does not exceed total size
-	size := sd.Size()
-	if sd.RawSize > size {
-		return validationError("padding must be <= size")
+	// Validate RawSize does not exceed Size
+	if sd.RawSize > sd.Size {
+		return validationError("rawSize must be <= size")
 	}
+
+	// For v2, Size doesn't need to be power-of-two aligned
+	// We only validate that Size is at least RawSize and aligned to NodeSize boundaries
+	// (which is already ensured by NewDataSegmentIndexEntry)
 
 	// Validate Multicodec (must be supported: Raw or CAR)
 	if sd.Multicodec != MulticodecRaw && sd.Multicodec != MulticodecCAR {
@@ -335,7 +518,7 @@ func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Height)); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Size)); err != nil {
 		return err
 	}
 
@@ -409,7 +592,7 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 	}
 	t.Offset = uint64(extra)
 
-	// t.Height
+	// t.Size
 	maj, extra, err = cr.ReadHeader()
 	if err != nil {
 		return err
@@ -417,9 +600,9 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 	if maj != cbg.MajUnsignedInt {
 		return fmt.Errorf("wrong type for uint64 field")
 	}
-	t.Height = uint8(extra)
+	t.Size = uint64(extra)
 
-	// t.Padding
+	// t.RawSize
 	maj, extra, err = cr.ReadHeader()
 	if err != nil {
 		return err

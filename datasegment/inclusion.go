@@ -1,9 +1,6 @@
 package datasegment
 
 import (
-	"crypto/sha256"
-	"github.com/filecoin-project/go-data-segment/datasegment/index"
-
 	"github.com/filecoin-project/go-data-segment/fr32"
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
@@ -11,20 +8,6 @@ import (
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
 )
-
-// computeEntryNode computes a Merkle tree node from two child nodes
-// This is the same logic as merkletree.computeNode but we need it here
-// since computeNode is not exported
-func computeEntryNode(left *merkletree.Node, right *merkletree.Node) *merkletree.Node {
-	sha := sha256.New()
-	sha.Write(left[:])
-	sha.Write(right[:])
-	digest := sha.Sum(nil)
-	node := merkletree.Node(digest)
-	// Truncate the last 2 bits (same as merkletree.truncate)
-	node[merkletree.NodeSize-1] &= 0b00111111
-	return &node
-}
 
 const BytesInInt = 8
 
@@ -56,7 +39,7 @@ type InclusionProof struct {
 }
 
 func indexAreaStart(sizePa abi.PaddedPieceSize) uint64 {
-	return uint64(sizePa) - uint64(index.MaxIndexEntriesInDeal(sizePa))*uint64(index.EntrySize)
+	return uint64(sizePa) - uint64(MaxIndexEntriesInDeal(sizePa))*uint64(EntrySize)
 }
 
 func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierData) (*InclusionAuxData, error) {
@@ -70,7 +53,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierDat
 	//  7. Check if DataSegmentIndexEntry falls into the correct area.
 	//	8. Compute second assumed aggregator's deal size.
 	//	9. Compare deal sizes and commitments from steps 2+3 against steps 5+6. Fail if not equal.
-	//	10. Return the computed values of aggregator's Commitment and NumEntries as AuxData.
+	//	10. Return the computed values of aggregator's Commitment and Size as AuxData.
 
 	if !util.IsPow2(uint64(veriferData.SizePc)) {
 		return nil, xerrors.Errorf("size of piece provided by verifier is not power of two")
@@ -101,22 +84,13 @@ func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierDat
 	// inclusion proof verification checks that index is less than the 1<<(path length)
 	dataOffset := ip.ProofSubtree.Index * uint64(veriferData.SizePc)
 
-	en := index.NewDataSegmentIndexEntry((*fr32.Fr32)(&nodeCommPc), dataOffset, uint64(veriferData.SizePc))
+	en, err := MakeDataSegmentIndexEntry((*fr32.Fr32)(&nodeCommPc), dataOffset, uint64(veriferData.SizePc))
+	if err != nil {
+		return nil, xerrors.Errorf("createding data segment index entry: %w", err)
+	}
 
-	// In v2, each index entry consists of 4 nodes
-	// We need to compute the Merkle root of these 4 nodes
-	// The 4 nodes form a small tree:
-	//   Level 0: n0, n1, n2, n3
-	//   Level 1: hash(n0, n1), hash(n2, n3)
-	//   Level 2: hash(hash(n0, n1), hash(n2, n3))
-	entryNodes := en.IntoNodes()
-	// Compute level 1: hash pairs (same as merkletree.computeNode)
-	level1Left := computeEntryNode(&entryNodes[0], &entryNodes[1])
-	level1Right := computeEntryNode(&entryNodes[2], &entryNodes[3])
-	// Compute level 2 (root): hash the two level-1 nodes
-	enNode := computeEntryNode(level1Left, level1Right)
+	enNode := merkletree.TruncatedHash(en.SerializeFr32())
 
-	// The proof is collected for the root of the 4-node entry subtree (level 2)
 	assumedCommPa2, err := ip.ProofIndex.ComputeRoot(enNode)
 	if err != nil {
 		return nil, xerrors.Errorf("could not validate the index proof: %w", err)
@@ -126,7 +100,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierDat
 		return nil, xerrors.Errorf("aggregator's data commiements don't match: %x != %x", assumedCommPa, assumedCommPa2)
 	}
 
-	const BytesInDataSegmentIndexEntry = 4 * merkletree.NodeSize // v2: 4 nodes per entry
+	const BytesInDataSegmentIndexEntry = 2 * merkletree.NodeSize
 
 	var assumedSizePa2 abi.PaddedPieceSize
 	{
@@ -148,7 +122,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(veriferData InclusionVerifierDat
 	}
 	if indexOffset < idxStart {
 		return nil, xerrors.Errorf("index entry at wrong position: %d < %d",
-			ip.ProofIndex.Index*uint64(index.EntrySize), idxStart)
+			ip.ProofIndex.Index*uint64(EntrySize), idxStart)
 	}
 
 	cidPa, err := lightCommP2Cid(*assumedCommPa)
@@ -169,15 +143,9 @@ func CollectInclusionProof(ht *merkletree.Hybrid, dealSize abi.PaddedPieceSize, 
 	}
 
 	iAS := indexAreaStart(dealSize)
-	entryNodeIndex := iAS/merkletree.NodeSize + 4*uint64(indexEntry) // 4 nodes per entry
-	// In v2, each entry consists of 4 nodes forming a small subtree
-	// We need to collect proof for the root of this 4-node subtree
-	// The root is at level 2 with index = entryNodeIndex / 4
-	entryRootLevel := 2
-	entryRootIndex := entryNodeIndex / 4
-	dsProof, err := ht.CollectProof(entryRootLevel, entryRootIndex)
+	dsProof, err := ht.CollectProof(1, iAS/EntrySize+uint64(indexEntry))
 	if err != nil {
-		return nil, xerrors.Errorf("collecting index entry proof: %w", err)
+		return nil, xerrors.Errorf("collecting subtree proof: %w", err)
 	}
 
 	return &InclusionProof{ProofSubtree: subTreeProof, ProofIndex: dsProof}, nil

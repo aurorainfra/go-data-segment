@@ -2,7 +2,6 @@ package datasegment
 
 import (
 	"bytes"
-	"github.com/filecoin-project/go-data-segment/datasegment/index"
 	"io"
 
 	"github.com/hashicorp/go-multierror"
@@ -18,13 +17,8 @@ import (
 
 type Aggregate struct {
 	DealSize abi.PaddedPieceSize
-	Index    index.PieceIndex
+	Index    IndexData
 	Tree     merkletree.Hybrid
-}
-
-type PieceInfo struct {
-	Size     uint64
-	PieceCID cid.Cid
 }
 
 // NewAggregate creates the structure for verifiable deal aggregation
@@ -33,94 +27,94 @@ func NewAggregate(dealSize abi.PaddedPieceSize, subdeals []abi.PieceInfo) (*Aggr
 	if err := dealSize.Validate(); err != nil {
 		return nil, xerrors.Errorf("invalid dealSize: %w", err)
 	}
-
-	maxEntries := index.MaxIndexEntriesInDeal(dealSize)
+	maxEntries := MaxIndexEntriesInDeal(dealSize)
 	if uint(len(subdeals)) > maxEntries {
 		return nil, xerrors.Errorf("too many subdeals for a %d sized deal: %d > %d",
 			dealSize, len(subdeals), maxEntries)
 	}
-
 	cl, totalSize, err := ComputeDealPlacement(subdeals)
 	if err != nil {
 		return nil, xerrors.Errorf("computing deal placment: %w", err)
 	}
 
-	if totalSize+uint64(maxEntries)*index.EntrySize > uint64(dealSize) {
+	if totalSize+uint64(maxEntries)*EntrySize > uint64(dealSize) {
 		return nil, xerrors.Errorf(
 			"sub-deals are too large to fit in the index: %d (packed subdeals) + %d (index) > %d (dealSize)",
-			totalSize, maxEntries*index.EntrySize, dealSize)
+			totalSize, maxEntries*EntrySize, dealSize)
 	}
 
 	ht, err := merkletree.NewHybrid(util.Log2Ceil(uint64(dealSize / merkletree.NodeSize)))
 	if err != nil {
 		return nil, xerrors.Errorf("failed creating hybrid tree: %w", err)
 	}
-	if err := ht.BatchSet(cl); err != nil {
+	err = ht.BatchSet(cl)
+	if err != nil {
 		return nil, xerrors.Errorf("batch set of deal nodes failed: %w", err)
 	}
-
-	pieces := make([]*index.SegmentDesc, 0, len(subdeals))
-	var offset uint64
-	for _, deal := range subdeals {
-		comm, err := commcid.CIDToPieceCommitmentV1(deal.PieceCID)
-		if err != nil {
-			return nil, xerrors.Errorf("converting to piece commitment: %w", err)
-		}
-		commP := (*fr32.Fr32)(comm)
-		pieces = append(pieces, index.NewDataSegmentIndexEntry(commP, offset, uint64(deal.Size)))
-		offset += uint64(deal.Size)
-	}
-
-	idx := &index.IndexData{}
-	if err := idx.InitFromPieces(pieces); err != nil {
+	index, err := MakeIndexFromCommLoc(cl)
+	if err != nil {
 		return nil, xerrors.Errorf("failed creating index: %w", err)
 	}
 
 	indexStartNodes := indexAreaStart(dealSize) / merkletree.NodeSize
-	batch := make([]merkletree.CommAndLoc, index.NodesPerEntry*idx.NumPieces())
-	for i := 0; i < idx.NumPieces(); i++ {
-		entry := idx.Entry(i)
-		nodes := entry.IntoNodes()
-		for j := 0; j < index.NodesPerEntry; j++ {
-			batch[index.NodesPerEntry*i+j] = merkletree.CommAndLoc{
-				Comm: nodes[j],
-				Loc: merkletree.Location{
-					Level: 0,
-					Index: indexStartNodes + uint64(index.NodesPerEntry*i+j),
-				},
-			}
+	batch := make([]merkletree.CommAndLoc, 2*len(index.Entries))
+	for i, e := range index.Entries {
+		ns := e.IntoNodes()
+		batch[2*i] = merkletree.CommAndLoc{
+			Comm: ns[0],
+			Loc:  merkletree.Location{Level: 0, Index: indexStartNodes + 2*uint64(i)},
+		}
+		batch[2*i+1] = merkletree.CommAndLoc{
+			Comm: ns[1],
+			Loc:  merkletree.Location{Level: 0, Index: indexStartNodes + 2*uint64(i) + 1},
 		}
 	}
-	if err := ht.BatchSet(batch); err != nil {
+	err = ht.BatchSet(batch)
+	if err != nil {
 		return nil, xerrors.Errorf("batch set of index nodes failed: %w", err)
 	}
 
-	return &Aggregate{
+	agg := Aggregate{
 		DealSize: dealSize,
-		Index:    idx,
+		Index:    *index,
 		Tree:     ht,
-	}, nil
+	}
+
+	return &agg, nil
 }
 
 // ProofForPieceInfo searches for piece within the Aggregate based on PieceInfo and gathers all the
 // information required to produce a proof.
 func (a Aggregate) ProofForPieceInfo(d abi.PieceInfo) (*InclusionProof, error) {
-	idx := a.Index.Search(d.PieceCID)
-	if idx == -1 {
+	comm, err := commcid.CIDToPieceCommitmentV1(d.PieceCID)
+	if err != nil {
+		return nil, xerrors.Errorf("convering cid to commitment: %w", err)
+	}
+	index := -1
+	for i, ie := range a.Index.Entries {
+		if bytes.Equal(ie.CommDs[:], comm) && ie.Size == uint64(d.Size) {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
 		return nil, xerrors.Errorf("entry for a piece with this PieceInfo was not found in Aggregate")
 	}
 
-	// Verify the size matches as well
-	entry := a.Index.Entry(idx)
-	if entry == nil {
-		return nil, xerrors.Errorf("entry at index %d is nil", idx)
-	}
-	if size := entry.Size(); size != uint64(d.Size) {
-		return nil, xerrors.Errorf("entry found but size mismatch: %d != %d", size, d.Size)
+	return a.ProofForIndexEntry(index)
+}
+
+// ProofForIndexEntry gathers information required to produce an InclusionProof based on the index
+// of data within the DataSegment Index.
+func (a Aggregate) ProofForIndexEntry(idx int) (*InclusionProof, error) {
+	e := a.Index.Entries[idx]
+	commLoc := e.CommAndLoc()
+	ip, err := CollectInclusionProof(&a.Tree, a.DealSize, commLoc, idx)
+	if err != nil {
+		return nil, xerrors.Errorf("collecting inclusion proof: %w", err)
 	}
 
-	commLoc := entry.CommAndLoc()
-	return CollectInclusionProof(&a.Tree, a.DealSize, commLoc, idx)
+	return ip, nil
 }
 
 // PieceCID returns the PieceCID of the deal containng all subdeals and the index
@@ -130,9 +124,9 @@ func (a Aggregate) PieceCID() (cid.Cid, error) {
 }
 
 func (a Aggregate) indexLoc() merkletree.Location {
-	level := util.Log2Ceil(index.EntrySize / merkletree.NodeSize * uint64(index.MaxIndexEntriesInDeal(a.DealSize)))
-	idx := uint64(1)<<(a.Tree.MaxLevel()-level) - 1
-	return merkletree.Location{Level: level, Index: idx}
+	level := util.Log2Ceil(EntrySize / merkletree.NodeSize * uint64(MaxIndexEntriesInDeal(a.DealSize)))
+	index := uint64(1)<<(a.Tree.MaxLevel()-level) - 1
+	return merkletree.Location{Level: level, Index: index}
 }
 
 // IndexPieceCID returns the PieceCID of the index
@@ -161,7 +155,7 @@ func (a Aggregate) IndexReader() (io.Reader, error) {
 	bNoPad := make([]byte, len(b)-len(b)/128)
 	fr32.Unpad(bNoPad, b)
 
-	unpaddedIndexSize := int64(index.MaxIndexEntriesInDeal(a.DealSize) * index.EntrySize)
+	unpaddedIndexSize := int64(MaxIndexEntriesInDeal(a.DealSize) * EntrySize)
 	unpaddedIndexSize = unpaddedIndexSize - unpaddedIndexSize/128
 	paddingSize := unpaddedIndexSize - int64(len(bNoPad))
 
@@ -171,11 +165,11 @@ func (a Aggregate) IndexReader() (io.Reader, error) {
 // IndexStartPosition returns the expected starting position where the index should be placed
 // in the unpadded units
 func (a Aggregate) IndexStartPosition() (uint64, error) {
-	return index.DataSegmentIndexStartOffset(a.DealSize), nil
+	return DataSegmentIndexStartOffset(a.DealSize), nil
 }
 
 func (a Aggregate) IndexSize() (abi.PaddedPieceSize, error) {
-	size := abi.PaddedPieceSize(uint64(index.MaxIndexEntriesInDeal(a.DealSize)) * index.EntrySize)
+	size := abi.PaddedPieceSize(uint64(MaxIndexEntriesInDeal(a.DealSize)) * EntrySize)
 	if err := size.Validate(); err != nil {
 		return abi.PaddedPieceSize(1<<64 - 1), xerrors.Errorf("validating index size %v, report this: %w", size, err)
 	}
@@ -187,8 +181,8 @@ func (a Aggregate) IndexSize() (abi.PaddedPieceSize, error) {
 // of the Aggregate.
 // AggregateStreamReader assumes a non-manipulated Index as created by the Aggregate constructor.
 func (a Aggregate) AggregateObjectReader(subPieceReaders []io.Reader) (io.Reader, error) {
-	if len(subPieceReaders) != a.Index.NumPieces() {
-		return nil, xerrors.Errorf("passed different number of subPieceReaders than subPieces: %d != %d", len(subPieceReaders), a.Index.NumPieces())
+	if len(subPieceReaders) != len(a.Index.Entries) {
+		return nil, xerrors.Errorf("passed different number of subPieceReaders than subPieces: %d != %d", len(subPieceReaders), len(a.Index.Entries))
 	}
 	readers := []io.Reader{}
 	add := func(r ...io.Reader) {
@@ -213,7 +207,7 @@ func (a Aggregate) AggregateObjectReader(subPieceReaders []io.Reader) (io.Reader
 
 	var errs error
 	for i := 0; i < len(subPieceReaders); i++ {
-		spEntry := a.Index.Entry(i)
+		spEntry := a.Index.Entries[i]
 		spOffset := spEntry.UnpaddedOffest()
 		spLen := spEntry.UnpaddedLength()
 
@@ -253,7 +247,7 @@ func (a Aggregate) AggregateObjectReader(subPieceReaders []io.Reader) (io.Reader
 	return io.MultiReader(readers...), nil
 }
 
-// ComputeDealPlacement takes in PieceInfos with Comm and NumPieces,
+// ComputeDealPlacement takes in PieceInfos with Comm and Size,
 // computes their placement in the tree and them in form of merkletree.CommAndLoc
 // also returns number of bytes required and any errors
 func ComputeDealPlacement(dealInfos []abi.PieceInfo) ([]merkletree.CommAndLoc, uint64, error) {

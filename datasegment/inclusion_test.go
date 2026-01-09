@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/filecoin-project/go-data-segment/datasegment/index"
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
 	commcid "github.com/filecoin-project/go-fil-commcid"
@@ -77,21 +76,15 @@ func TestComputeExpectedAuxData1(t *testing.T) {
 	var SizePa abi.PaddedPieceSize = 32 << 30
 	ht, col := buildDealTree(t, SizePa, sampleSizes1)
 
-	idx := &index.IndexData{}
-	err := idx.InitFromPieces(col)
+	index, err := MakeIndexFromCommLoc(col)
+
 	require.NoError(t, err)
 	indexStartNodes := indexAreaStart(SizePa) / merkletree.NodeSize
-	for i := 0; i < idx.NumPieces(); i++ {
-		e := idx.Entry(i)
+	for i, e := range index.Entries {
 		ns := e.IntoNodes()
-		// v2: each entry consists of 4 nodes
-		err := ht.SetNode(0, indexStartNodes+4*uint64(i), &ns[0])
+		err := ht.SetNode(0, indexStartNodes+2*uint64(i), &ns[0])
 		assert.NoError(t, err)
-		err = ht.SetNode(0, indexStartNodes+4*uint64(i)+1, &ns[1])
-		assert.NoError(t, err)
-		err = ht.SetNode(0, indexStartNodes+4*uint64(i)+2, &ns[2])
-		assert.NoError(t, err)
-		err = ht.SetNode(0, indexStartNodes+4*uint64(i)+3, &ns[3])
+		err = ht.SetNode(0, indexStartNodes+2*uint64(i)+1, &ns[1])
 		assert.NoError(t, err)
 	}
 

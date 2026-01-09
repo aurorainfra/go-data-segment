@@ -23,6 +23,7 @@ require (
 	github.com/ipfs/go-ipld-cbor v0.0.6 // indirect
 	github.com/ipfs/go-ipld-format v0.0.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.4 // indirect
+	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/minio/blake2b-simd v0.0.0-20160723061019-3f5f724cb5b1 // indirect
 	github.com/minio/sha256-simd v1.0.1-0.20230130105256-d9c3aea9e949 // indirect
 	github.com/mr-tron/base58 v1.2.0 // indirect
@@ -37,3 +38,5 @@ require (
 	golang.org/x/sys v0.30.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/filecoin-project/go-fil-commp-hashhash => github.com/filecoin-project/go-fil-commp-hashhash v0.2.1-0.20260107152413-d6952fff4f39
