@@ -8,6 +8,7 @@ require (
 	github.com/filecoin-project/go-state-types v0.9.9
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/ipfs/go-cid v0.3.2
+	github.com/minio/sha256-simd v1.0.1-0.20230130105256-d9c3aea9e949
 	github.com/stretchr/testify v1.8.1
 	github.com/whyrusleeping/cbor-gen v0.0.0-20230126041949-52956bd4c9aa
 	golang.org/x/exp v0.0.0-20230418202329-0354be287a23
@@ -25,7 +26,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.4 // indirect
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/minio/blake2b-simd v0.0.0-20160723061019-3f5f724cb5b1 // indirect
-	github.com/minio/sha256-simd v1.0.1-0.20230130105256-d9c3aea9e949 // indirect
 	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/multiformats/go-base32 v0.0.3 // indirect
 	github.com/multiformats/go-base36 v0.1.0 // indirect
