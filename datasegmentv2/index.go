@@ -66,6 +66,70 @@ func (id *IndexDataV2) InitFromPieces(pieces []*SegmentDesc) error {
 	return nil
 }
 
+// ParseIndexSection reads the index section from the tail of the sector backwards.
+// It reads 4KB chunks and within each chunk parses EntrySize-sized segment entries from the end
+// backwards, validating each with checksum; when a checksum mismatch is found, the index section
+// is considered ended and parsing stops.
+// reader must allow reading the last size bytes (e.g. a SectionReader over the index region).
+func (id *IndexDataV2) ParseIndexSection(reader io.ReaderAt, size int64) error {
+	if size < int64(EntrySize) {
+		return xerrors.Errorf("invalid index section: size %d < EntrySize %d", size, EntrySize)
+	}
+
+	const blockSize = 4096 // read 4KB at a time and scan backwards for entries
+	entries := make([]*SegmentDesc, 0)
+	buf := make([]byte, blockSize)
+	// Read from the tail in 4KB chunks
+	readEnd := size
+	done := false
+
+	for readEnd > 0 && !done {
+		toRead := int64(blockSize)
+		if readEnd < toRead {
+			toRead = readEnd
+		}
+		// Align down to full entries so we never parse partial 128-byte blocks
+		toRead = (toRead / int64(EntrySize)) * int64(EntrySize)
+		if toRead == 0 {
+			break
+		}
+
+		readStart := readEnd - toRead
+		n, err := reader.ReadAt(buf[:toRead], readStart)
+		if err != nil && err != io.EOF {
+			return xerrors.Errorf("reading at offset %d: %w", readStart, err)
+		}
+		if n != int(toRead) {
+			break
+		}
+
+		// Within this chunk, process 128-byte entries from the end backwards
+		for i := int(toRead) - EntrySize; i >= 0; i -= EntrySize {
+			var entry SegmentDesc
+			if err := entry.UnmarshalBinary(buf[i : i+EntrySize]); err != nil {
+				done = true
+				break
+			}
+			if err := entry.Validate(); err != nil {
+				// Checksum mismatch or other validation failure: index section has ended
+				done = true
+				break
+			}
+			entries = append(entries, &entry)
+		}
+
+		readEnd = readStart
+	}
+
+	// We collected from tail to head; reverse so entries are in logical order (first segment first)
+	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+		entries[i], entries[j] = entries[j], entries[i]
+	}
+
+	id.Entries = entries
+	return nil
+}
+
 // NumPieces returns the number of entries in the index
 func (id *IndexDataV2) NumPieces() int {
 	return len(id.Entries)
