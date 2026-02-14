@@ -3,12 +3,17 @@ package datasegmentv2
 import (
 	"bytes"
 	"encoding"
+	"io"
+	"runtime"
+	"sort"
+
+	"github.com/filecoin-project/go-data-segment/fr32"
 	"github.com/filecoin-project/go-data-segment/util"
 	commcid "github.com/filecoin-project/go-fil-commcid"
+	"github.com/filecoin-project/go-fil-commp-hashhash/commp2"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
-	"io"
 )
 
 type validationError string
@@ -25,7 +30,6 @@ func (ve validationError) Is(err error) bool {
 }
 
 type PieceIndex interface {
-	InitFromPieces(dealInfos []*SegmentDesc) error
 	NumPieces() int
 	Entry(idx int) *SegmentDesc
 	Search(cid cid.Cid) int
@@ -50,19 +54,169 @@ type IndexDataV2 struct {
 
 var _ PieceIndex = (*IndexDataV2)(nil)
 
-func NewIndexFromPieces(data []io.Reader, offsets []int64, lens []int64) (*IndexDataV2, error) {
-	return nil, nil
+const readBlockSize = 4096
+
+// blobTask is sent from the assembler to workers: one blob's data to compute digest.
+type blobTask struct {
+	index  int   // original blob index (for ordering results)
+	offset int64 // sector offset of this blob
+	size   int64
+	data   []byte // copy of blob data
 }
 
-// InitFromPieces initializes the index from piece information
-func (id *IndexDataV2) InitFromPieces(pieces []*SegmentDesc) error {
-	entries := make([]*SegmentDesc, 0, len(pieces))
-	for i := range pieces {
-		sd := &SegmentDesc{}
-		*sd = *pieces[i]
-		entries = append(entries, sd)
+// blobResult is sent from workers back to the collector.
+type blobResult struct {
+	index   int
+	segment *SegmentDesc
+}
+
+// BuildFromSector builds the index from sector data using a reader goroutine, an assembler goroutine, and multiple worker goroutines.
+// One goroutine only reads the sector in 4KB blocks and sends them to a second goroutine, which assembles the stream,
+// extracts blob data by offsets/sizes, and sends computation tasks to workers that run commp2 digest; results are collected and ordered.
+func (id *IndexDataV2) BuildFromSector(sector io.ReaderAt, blobOffsets []int64, blobSizes []int64) error {
+	if len(blobSizes) != len(blobOffsets) {
+		return xerrors.Errorf("invalid blobs. offsets and sizes should be of the same length")
 	}
-	id.Entries = entries
+	blobCnt := len(blobOffsets)
+	if blobCnt == 0 {
+		return xerrors.Errorf("empty blobs")
+	}
+
+	// Sort blob indices by offset so the assembler can emit in read order and compact the buffer.
+	type blobInfo struct {
+		index        int
+		offset, size int64
+	}
+	blobs := make([]blobInfo, blobCnt)
+	for i := range blobOffsets {
+		blobs[i] = blobInfo{index: i, offset: blobOffsets[i], size: blobSizes[i]}
+	}
+	sort.Slice(blobs, func(i, j int) bool { return blobs[i].offset < blobs[j].offset })
+
+	sectorEnd := int64(0)
+	for _, b := range blobs {
+		if end := b.offset + b.size; end > sectorEnd {
+			sectorEnd = end
+		}
+	}
+
+	numWorkers := min(runtime.NumCPU(), blobCnt)
+
+	taskCh := make(chan blobTask, numWorkers*2)
+	resultCh := make(chan blobResult, numWorkers*2)
+	// blockCh carries 4KB (or smaller) chunks from reader to assembler; sender closes when done.
+	blockCh := make(chan []byte, 32)
+
+	// Worker goroutines: consume tasks, compute digest, send results.
+	for w := 0; w < numWorkers; w++ {
+		go func() {
+			for t := range taskCh {
+				cal := commp2.Calc{}
+				if err := cal.BeginAt(uint64(t.offset)); err != nil {
+					resultCh <- blobResult{index: t.index, segment: nil}
+					continue
+				}
+				cal.Write(t.data)
+				commP, _, _ := cal.Digest()
+				resultCh <- blobResult{
+					index:   t.index,
+					segment: NewDataSegmentIndexEntry((*fr32.Fr32)(commP), uint64(t.offset), uint64(t.size)),
+				}
+			}
+		}()
+	}
+
+	// Goroutine 1: only read sector in 4KB blocks and send to blockCh.
+	go func() {
+		for readPos := int64(0); readPos < sectorEnd; {
+			toRead := readBlockSize
+			if sectorEnd-readPos < int64(toRead) {
+				toRead = int(sectorEnd - readPos)
+			}
+			readBlock := make([]byte, toRead)
+			nr, err := sector.ReadAt(readBlock, readPos)
+			if err != nil || nr == 0 {
+				break
+			}
+			blockCh <- readBlock
+			readPos += int64(nr)
+		}
+		close(blockCh)
+	}()
+
+	// Goroutine 2: receive blocks in order, assemble buffer, parse out blobs and send tasks to taskCh.
+	go func() {
+		defer close(taskCh)
+		var buffer []byte
+		var bufferBase int64
+		readPos := int64(0)
+		nextBlob := 0
+
+		for chunk := range blockCh {
+			buffer = append(buffer, chunk...)
+			readPos += int64(len(chunk))
+
+			// Discard prefix we no longer need: keep only [nextBlobStart, readPos] to bound memory.
+			if nextBlob < blobCnt {
+				wantBase := blobs[nextBlob].offset
+				if wantBase > bufferBase {
+					drop := wantBase - bufferBase
+					if drop <= int64(len(buffer)) {
+						buffer = buffer[drop:]
+						bufferBase = wantBase
+					}
+				}
+			}
+
+			// Emit all blobs that are now fully in buffer.
+			for nextBlob < blobCnt {
+				b := blobs[nextBlob]
+				blobEnd := b.offset + b.size
+				if readPos < blobEnd {
+					break
+				}
+				startInBuf := b.offset - bufferBase
+				endInBuf := blobEnd - bufferBase
+				if startInBuf < 0 || endInBuf > int64(len(buffer)) {
+					break
+				}
+				data := make([]byte, b.size)
+				copy(data, buffer[startInBuf:endInBuf])
+				taskCh <- blobTask{index: b.index, offset: b.offset, size: b.size, data: data}
+				nextBlob++
+
+				oldBase := bufferBase
+				if nextBlob < blobCnt {
+					bufferBase = blobs[nextBlob].offset
+				} else {
+					bufferBase = readPos
+				}
+				drop := bufferBase - oldBase
+				if drop > 0 && drop <= int64(len(buffer)) {
+					buffer = buffer[drop:]
+				}
+			}
+		}
+	}()
+
+	// Collect results: we receive blobCnt results (one per blob), order by index.
+	segments := make([]*SegmentDesc, blobCnt)
+	received := 0
+	for received < blobCnt {
+		r := <-resultCh
+		if r.index >= 0 && r.index < blobCnt {
+			segments[r.index] = r.segment
+			received++
+		}
+	}
+
+	// Verify we have all segments (workers send nil on BeginAt error).
+	for i := range segments {
+		if segments[i] == nil {
+			return xerrors.Errorf("failed to build segment for blob %d (offset %d size %d)", i, blobOffsets[i], blobSizes[i])
+		}
+	}
+	id.Entries = segments
 	return nil
 }
 
@@ -173,10 +327,10 @@ func (i *IndexDataV2) IndexSize() uint64 {
 	return uint64(i.NumPieces()) * uint64(EntrySize)
 }
 
-var _ encoding.BinaryMarshaler = IndexDataV2{}
+var _ encoding.BinaryMarshaler = &IndexDataV2{}
 var _ encoding.BinaryUnmarshaler = (*IndexDataV2)(nil)
 
-func (id IndexDataV2) MarshalBinary() (data []byte, err error) {
+func (id *IndexDataV2) MarshalBinary() (data []byte, err error) {
 	res := make([]byte, EntrySize*len(id.Entries))
 	for i, r := range id.Entries {
 		if r != nil {
@@ -204,14 +358,4 @@ func (id *IndexDataV2) UnmarshalBinary(data []byte) error {
 		id.Entries[i] = &entry
 	}
 	return nil
-}
-
-// SegmentRoot computes the root of the client's segment's subtree
-// treeDepth is the depth of the tree where the client segment is located
-// segmentSize is the amount of leafs needed for the client's segment
-// segmentOffset is the index of the first leaf where the client's segment starts. 0-indexed
-func SegmentRoot(treeDepth int, segmentSize uint64, segmentOffset uint64) (int, uint64) {
-	lvl := treeDepth - util.Log2Ceil(uint64(segmentSize)) - 1
-	idx := segmentOffset >> util.Log2Ceil(uint64(segmentSize))
-	return lvl, idx
 }

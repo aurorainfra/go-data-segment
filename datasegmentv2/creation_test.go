@@ -6,10 +6,10 @@ import (
 	"io"
 	"testing"
 
-	commcid "github.com/filecoin-project/go-fil-commcid"
-	commp2 "github.com/filecoin-project/go-fil-commp-hashhash/commp2"
 	"github.com/filecoin-project/go-data-segment/fr32"
 	"github.com/filecoin-project/go-data-segment/merkletree"
+	commcid "github.com/filecoin-project/go-fil-commcid"
+	commp2 "github.com/filecoin-project/go-fil-commp-hashhash/commp2"
 	"github.com/filecoin-project/go-state-types/abi"
 	cid "github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/assert"
@@ -278,33 +278,6 @@ func TestAggregateV2_IndexPieceCID(t *testing.T) {
 	assert.Equal(t, 32, len(commP))
 }
 
-// TestAggregateV2_IndexStartPosition tests getting the index start position
-func TestAggregateV2_IndexStartPosition(t *testing.T) {
-	dealSize := abi.PaddedPieceSize(1 << 20) // 1 MiB
-	pieceData := makeTestDataCreation(1024)
-
-	pieces := []PieceData{
-		{
-			Reader: bytes.NewReader(pieceData),
-			PieceInfo: PieceInfo{
-				BeginAt: 0,
-				RawSize: 1024,
-			},
-		},
-	}
-
-	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-
-	indexStart, err := agg.IndexStartPosition()
-	require.NoError(t, err)
-
-	// Index should start before the end of the deal
-	expectedStart := DataSegmentIndexStartOffset(dealSize)
-	assert.Equal(t, expectedStart, indexStart)
-	assert.Less(t, indexStart, uint64(dealSize.Unpadded()))
-}
-
 // TestAggregateV2_IndexSize tests getting the index size
 func TestAggregateV2_IndexSize(t *testing.T) {
 	dealSize := abi.PaddedPieceSize(1 << 20) // 1 MiB
@@ -427,77 +400,6 @@ func TestAggregateV2_ProofForIndexEntry_InvalidIndex(t *testing.T) {
 	_, err = agg.ProofForIndexEntry(agg.Index.NumPieces())
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid piece index")
-}
-
-// TestAggregateV2_AggregateObjectReader tests creating aggregate object reader
-func TestAggregateV2_AggregateObjectReader(t *testing.T) {
-	dealSize := abi.PaddedPieceSize(1 << 20) // 1 MiB
-	piece1Data := makeTestDataCreation(512)
-	piece2Data := makeTestDataCreation(256)
-
-	pieces := []PieceData{
-		{
-			Reader: bytes.NewReader(piece1Data),
-			PieceInfo: PieceInfo{
-				BeginAt: 0,
-				RawSize: 512,
-			},
-		},
-		{
-			Reader: bytes.NewReader(piece2Data),
-			PieceInfo: PieceInfo{
-				BeginAt: 1024,
-				RawSize: 256,
-			},
-		},
-	}
-
-	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-
-	// Create readers for pieces
-	readers := []io.Reader{
-		bytes.NewReader(piece1Data),
-		bytes.NewReader(piece2Data),
-	}
-
-	aggReader, err := agg.AggregateObjectReader(readers)
-	require.NoError(t, err)
-	require.NotNil(t, aggReader)
-
-	// Read all data
-	aggData, err := io.ReadAll(aggReader)
-	require.NoError(t, err)
-	assert.Greater(t, len(aggData), 0)
-}
-
-// TestAggregateV2_AggregateObjectReader_WrongCount tests error handling for wrong reader count
-func TestAggregateV2_AggregateObjectReader_WrongCount(t *testing.T) {
-	dealSize := abi.PaddedPieceSize(1 << 20) // 1 MiB
-	pieceData := makeTestDataCreation(1024)
-
-	pieces := []PieceData{
-		{
-			Reader: bytes.NewReader(pieceData),
-			PieceInfo: PieceInfo{
-				BeginAt: 0,
-				RawSize: 1024,
-			},
-		},
-	}
-
-	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-
-	// Pass wrong number of readers
-	readers := []io.Reader{
-		bytes.NewReader(pieceData),
-		bytes.NewReader(pieceData), // Extra reader
-	}
-
-	_, err = agg.AggregateObjectReader(readers)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "different number")
 }
 
 // TestNewAggregate_MisalignedPieces tests creating aggregate with misaligned pieces
@@ -776,14 +678,14 @@ func TestSegmentDesc_ComputePieceCIDV2WithData(t *testing.T) {
 	// Test with aligned piece (offset = 0)
 	t.Run("AlignedPiece", func(t *testing.T) {
 		pieceData := makeTestDataCreation(1024)
-		
+
 		// Create a SegmentDesc with offset 0
 		entry := NewDataSegmentIndexEntry(
 			(*fr32.Fr32)(&merkletree.Node{}), // CommDs will be computed
 			0,                                // Offset = 0 (aligned)
 			1024,                             // RawSize
 		)
-		
+
 		// Calculate CommP using commp2 directly for comparison
 		calc := &commp2.Calc{}
 		require.NoError(t, calc.BeginAt(0))
@@ -793,12 +695,12 @@ func TestSegmentDesc_ComputePieceCIDV2WithData(t *testing.T) {
 		require.NoError(t, err)
 		expectedCID, err := commcid.PieceCommitmentV1ToCID(expectedDigest)
 		require.NoError(t, err)
-		
+
 		// Compute Piece CID v2 using ComputePieceCIDV2WithData
 		pieceCID, err := entry.ComputePieceCIDV2WithData(bytes.NewReader(pieceData), 0)
 		require.NoError(t, err)
 		assert.False(t, pieceCID.Equals(cid.Undef))
-		
+
 		// Should match the expected CID
 		assert.True(t, pieceCID.Equals(expectedCID),
 			"Piece CID v2 should match commp2 calculation\n"+
@@ -806,19 +708,19 @@ func TestSegmentDesc_ComputePieceCIDV2WithData(t *testing.T) {
 				"  Got:      %s",
 			expectedCID.String(), pieceCID.String())
 	})
-	
+
 	// Test with misaligned piece (offset > 0)
 	t.Run("MisalignedPiece", func(t *testing.T) {
 		pieceData := makeTestDataCreation(512)
 		offset := uint64(127) // Non-aligned offset
-		
+
 		// Create a SegmentDesc with non-zero offset
 		entry := NewDataSegmentIndexEntry(
 			(*fr32.Fr32)(&merkletree.Node{}), // CommDs will be computed
-			offset,                            // Offset > 0 (misaligned)
+			offset,                           // Offset > 0 (misaligned)
 			512,                              // RawSize
 		)
-		
+
 		// Calculate CommP using commp2 directly for comparison
 		calc := &commp2.Calc{}
 		require.NoError(t, calc.BeginAt(offset))
@@ -828,12 +730,12 @@ func TestSegmentDesc_ComputePieceCIDV2WithData(t *testing.T) {
 		require.NoError(t, err)
 		expectedCID, err := commcid.PieceCommitmentV1ToCID(expectedDigest)
 		require.NoError(t, err)
-		
+
 		// Compute Piece CID v2 using ComputePieceCIDV2WithData
 		pieceCID, err := entry.ComputePieceCIDV2WithData(bytes.NewReader(pieceData), 0)
 		require.NoError(t, err)
 		assert.False(t, pieceCID.Equals(cid.Undef))
-		
+
 		// Should match the expected CID
 		assert.True(t, pieceCID.Equals(expectedCID),
 			"Piece CID v2 should match commp2 calculation for misaligned piece\n"+
@@ -842,7 +744,7 @@ func TestSegmentDesc_ComputePieceCIDV2WithData(t *testing.T) {
 				"  Offset:  %d",
 			expectedCID.String(), pieceCID.String(), offset)
 	})
-	
+
 	// Test error cases
 	t.Run("ZeroRawSize", func(t *testing.T) {
 		entry := NewDataSegmentIndexEntry(
@@ -850,22 +752,22 @@ func TestSegmentDesc_ComputePieceCIDV2WithData(t *testing.T) {
 			0,
 			0, // Zero RawSize
 		)
-		
+
 		_, err := entry.ComputePieceCIDV2WithData(bytes.NewReader([]byte{}), 0)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "RawSize cannot be zero")
 	})
-	
+
 	// Test with data size mismatch
 	t.Run("DataSizeMismatch", func(t *testing.T) {
 		pieceData := makeTestDataCreation(1024)
-		
+
 		entry := NewDataSegmentIndexEntry(
 			(*fr32.Fr32)(&merkletree.Node{}),
 			0,
 			2048, // RawSize larger than actual data
 		)
-		
+
 		// Should fail because we can't read enough data
 		_, err := entry.ComputePieceCIDV2WithData(bytes.NewReader(pieceData), 0)
 		assert.Error(t, err)

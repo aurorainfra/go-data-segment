@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"io"
 
-	"github.com/hashicorp/go-multierror"
 	cid "github.com/ipfs/go-cid"
 	xerrors "golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-data-segment/fr32"
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	commcid "github.com/filecoin-project/go-fil-commcid"
-	commp2 "github.com/filecoin-project/go-fil-commp-hashhash/commp2"
 	abi "github.com/filecoin-project/go-state-types/abi"
 )
 
@@ -31,188 +29,189 @@ type AggregateV2 struct {
 //   - dealSize: The target size of the aggregate deal
 //   - pieces: List of pieces with their data readers, offsets, and sizes
 func NewAggregate(dealSize abi.PaddedPieceSize, pieces []PieceData) (*AggregateV2, error) {
-	if err := dealSize.Validate(); err != nil {
-		return nil, xerrors.Errorf("invalid dealSize: %w", err)
-	}
-	maxEntries := MaxIndexEntriesInDeal(dealSize)
-	if uint(len(pieces)) > maxEntries {
-		return nil, xerrors.Errorf("too many pieces for a %d sized deal: %d > %d",
-			dealSize, len(pieces), maxEntries)
-	}
-
-	// Validate pieces and calculate total size
-	var piecesTotalSize uint64
-	for i, piece := range pieces {
-		if piece.RawSize == 0 {
-			return nil, xerrors.Errorf("piece %d: RawSize cannot be zero", i)
-		}
-		if piece.BeginAt < piecesTotalSize {
-			return nil, xerrors.Errorf("piece %d: overlap with previous data", i)
-		}
-		piecesTotalSize = piece.BeginAt + piece.RawSize
-	}
-
-	// Check if pieces and index fit in the deal
-	indexSize := uint64(maxEntries) * EntrySize
-	if piecesTotalSize+indexSize > uint64(dealSize) {
-		return nil, xerrors.Errorf(
-			"pieces are too large to fit in the deal: %d (pieces) + %d (index) > %d (dealSize)",
-			piecesTotalSize, indexSize, dealSize)
-	}
-
-	// Calculate sector size (pre-Fr32-padding)
-	// The sector size should accommodate all pieces plus the index
-	sectorSizePreFr32 := uint64(dealSize.Unpadded())
-
-	// Read all piece data and create new readers for reuse
-	// This is necessary because bytes.NewReader can only be read once
-	pieceDataList := make([][]byte, len(pieces))
-	piecesWithNewReaders := make([]PieceData, len(pieces))
-	for i, piece := range pieces {
-		pieceData, err := io.ReadAll(piece.Reader)
-		if err != nil {
-			return nil, xerrors.Errorf("reading piece %d data: %w", i, err)
-		}
-		if uint64(len(pieceData)) != piece.RawSize {
-			return nil, xerrors.Errorf("piece %d data size mismatch: expected %d, got %d",
-				i, piece.RawSize, len(pieceData))
-		}
-		pieceDataList[i] = pieceData
-		piecesWithNewReaders[i] = PieceData{
-			Reader: bytes.NewReader(pieceData),
-			PieceInfo: PieceInfo{
-				BeginAt: piece.BeginAt,
-				RawSize: piece.RawSize,
-			},
-		}
-	}
-
-	// Create index entries from pieces
-	// We compute CommP for each piece using commp2 with BeginAt to ensure consistency
-	// This matches how pieces are verified independently
-	indexEntries := make([]*SegmentDesc, len(pieces))
-	for i, piece := range piecesWithNewReaders {
-		// Use commp2 to calculate the CommP for this piece at its offset
-		// This ensures the CommP matches what would be calculated independently
-		calc := &commp2.Calc{}
-		if err := calc.BeginAt(piece.BeginAt); err != nil {
-			return nil, xerrors.Errorf("piece %d: failed to set BeginAt: %w", i, err)
-		}
-
-		// Write the piece data
-		n, err := calc.Write(pieceDataList[i])
-		if err != nil {
-			return nil, xerrors.Errorf("piece %d: failed to write data to commp2: %w", i, err)
-		}
-		if n != len(pieceDataList[i]) {
-			return nil, xerrors.Errorf("piece %d: incomplete write to commp2: %d != %d", i, n, len(pieceDataList[i]))
-		}
-
-		// Get the CommP digest from commp2
-		commp2Digest, _, err := calc.Digest()
-		if err != nil {
-			return nil, xerrors.Errorf("piece %d: failed to get digest from commp2: %w", i, err)
-		}
-		if len(commp2Digest) != 32 {
-			return nil, xerrors.Errorf("piece %d: invalid digest length: %d", i, len(commp2Digest))
-		}
-
-		// Convert digest to merkletree.Node
-		var commDs merkletree.Node
-		copy(commDs[:], commp2Digest)
-
-		// Create SegmentDesc entry
-		entry := NewDataSegmentIndexEntry(
-			(*fr32.Fr32)(&commDs),
-			piece.BeginAt,
-			piece.RawSize,
-		).WithUpdatedChecksum()
-
-		indexEntries[i] = entry
-	}
-
-	// Create index from entries
-	index := &IndexDataV2{}
-	if err := index.InitFromPieces(indexEntries); err != nil {
-		return nil, xerrors.Errorf("failed creating index: %w", err)
-	}
-
-	// Add index entries to the tree by creating a PieceData for the index
-	// The index starts at DataSegmentIndexStartOffset(dealSize) in unpadded bytes
-	indexStartUnpadded := DataSegmentIndexStartOffset(dealSize)
-
-	// Marshal index to bytes (same logic as IndexReader)
-	indexBytes, err := index.MarshalBinary()
-	if err != nil {
-		return nil, xerrors.Errorf("failed marshaling index: %w", err)
-	}
-
-	// Pad to 128-byte boundaries for Fr32
-	if rem := len(indexBytes) % 128; rem != 0 {
-		indexBytes = append(indexBytes, make([]byte, 128-rem)...)
-	}
-
-	// Unpad for reading (to get pre-Fr32 size)
-	unpaddedSize := len(indexBytes) - len(indexBytes)/128
-	bNoPad := make([]byte, unpaddedSize)
-	fr32.Unpad(bNoPad, indexBytes)
-
-	// Calculate the expected unpadded index size (same as IndexReader)
-	unpaddedIndexSize := int64(MaxIndexEntriesInDeal(dealSize) * EntrySize)
-	unpaddedIndexSize = unpaddedIndexSize - unpaddedIndexSize/128
-	paddingSize := unpaddedIndexSize - int64(len(bNoPad))
-
-	// Ensure paddingSize is non-negative
-	if paddingSize < 0 {
-		paddingSize = 0
-	}
-
-	// Create a reader that includes padding (same as IndexReader)
-	var indexReader io.Reader = bytes.NewReader(bNoPad)
-	if paddingSize > 0 {
-		indexReader = io.MultiReader(bytes.NewReader(bNoPad), io.LimitReader(zeroReader{}, paddingSize))
-	}
-
-	// Read all index data including padding
-	indexUnpaddedBytes, err := io.ReadAll(indexReader)
-	if err != nil {
-		return nil, xerrors.Errorf("failed reading index data: %w", err)
-	}
-
-	// Create a PieceData for the index
-	indexPiece := PieceData{
-		Reader: bytes.NewReader(indexUnpaddedBytes),
-		PieceInfo: PieceInfo{
-			BeginAt: indexStartUnpadded,
-			RawSize: uint64(len(indexUnpaddedBytes)),
-		},
-	}
-
-	// Recreate readers for all pieces before rebuilding the tree
-	// This ensures that pieces can be read again when rebuilding the tree
-	allPieces := make([]PieceData, len(piecesWithNewReaders))
-	for i, pieceData := range pieceDataList {
-		allPieces[i] = PieceData{
-			Reader: bytes.NewReader(pieceData),
-			PieceInfo: PieceInfo{
-				BeginAt: piecesWithNewReaders[i].BeginAt,
-				RawSize: piecesWithNewReaders[i].RawSize,
-			},
-		}
-	}
-	allPieces = append(allPieces, indexPiece)
-	treeWithIndex, err := BuildSectorTree(allPieces, sectorSizePreFr32)
-	if err != nil {
-		return nil, xerrors.Errorf("failed building sector tree with index: %w", err)
-	}
-
-	agg := AggregateV2{
-		DealSize: dealSize,
-		Index:    index,
-		Tree:     treeWithIndex,
-	}
-
-	return &agg, nil
+	//if err := dealSize.Validate(); err != nil {
+	//	return nil, xerrors.Errorf("invalid dealSize: %w", err)
+	//}
+	//maxEntries := MaxIndexEntriesInDeal(dealSize)
+	//if uint(len(pieces)) > maxEntries {
+	//	return nil, xerrors.Errorf("too many pieces for a %d sized deal: %d > %d",
+	//		dealSize, len(pieces), maxEntries)
+	//}
+	//
+	//// Validate pieces and calculate total size
+	//var piecesTotalSize uint64
+	//for i, piece := range pieces {
+	//	if piece.RawSize == 0 {
+	//		return nil, xerrors.Errorf("piece %d: RawSize cannot be zero", i)
+	//	}
+	//	if piece.BeginAt < piecesTotalSize {
+	//		return nil, xerrors.Errorf("piece %d: overlap with previous data", i)
+	//	}
+	//	piecesTotalSize = piece.BeginAt + piece.RawSize
+	//}
+	//
+	//// Check if pieces and index fit in the deal
+	//indexSize := uint64(maxEntries) * EntrySize
+	//if piecesTotalSize+indexSize > uint64(dealSize) {
+	//	return nil, xerrors.Errorf(
+	//		"pieces are too large to fit in the deal: %d (pieces) + %d (index) > %d (dealSize)",
+	//		piecesTotalSize, indexSize, dealSize)
+	//}
+	//
+	//// Calculate sector size (pre-Fr32-padding)
+	//// The sector size should accommodate all pieces plus the index
+	//sectorSizePreFr32 := uint64(dealSize.Unpadded())
+	//
+	//// Read all piece data and create new readers for reuse
+	//// This is necessary because bytes.NewReader can only be read once
+	//pieceDataList := make([][]byte, len(pieces))
+	//piecesWithNewReaders := make([]PieceData, len(pieces))
+	//for i, piece := range pieces {
+	//	pieceData, err := io.ReadAll(piece.Reader)
+	//	if err != nil {
+	//		return nil, xerrors.Errorf("reading piece %d data: %w", i, err)
+	//	}
+	//	if uint64(len(pieceData)) != piece.RawSize {
+	//		return nil, xerrors.Errorf("piece %d data size mismatch: expected %d, got %d",
+	//			i, piece.RawSize, len(pieceData))
+	//	}
+	//	pieceDataList[i] = pieceData
+	//	piecesWithNewReaders[i] = PieceData{
+	//		Reader: bytes.NewReader(pieceData),
+	//		PieceInfo: PieceInfo{
+	//			BeginAt: piece.BeginAt,
+	//			RawSize: piece.RawSize,
+	//		},
+	//	}
+	//}
+	//
+	//// Create index entries from pieces
+	//// We compute CommP for each piece using commp2 with BeginAt to ensure consistency
+	//// This matches how pieces are verified independently
+	//indexEntries := make([]*SegmentDesc, len(pieces))
+	//for i, piece := range piecesWithNewReaders {
+	//	// Use commp2 to calculate the CommP for this piece at its offset
+	//	// This ensures the CommP matches what would be calculated independently
+	//	calc := &commp2.Calc{}
+	//	if err := calc.BeginAt(piece.BeginAt); err != nil {
+	//		return nil, xerrors.Errorf("piece %d: failed to set BeginAt: %w", i, err)
+	//	}
+	//
+	//	// Write the piece data
+	//	n, err := calc.Write(pieceDataList[i])
+	//	if err != nil {
+	//		return nil, xerrors.Errorf("piece %d: failed to write data to commp2: %w", i, err)
+	//	}
+	//	if n != len(pieceDataList[i]) {
+	//		return nil, xerrors.Errorf("piece %d: incomplete write to commp2: %d != %d", i, n, len(pieceDataList[i]))
+	//	}
+	//
+	//	// Get the CommP digest from commp2
+	//	commp2Digest, _, err := calc.Digest()
+	//	if err != nil {
+	//		return nil, xerrors.Errorf("piece %d: failed to get digest from commp2: %w", i, err)
+	//	}
+	//	if len(commp2Digest) != 32 {
+	//		return nil, xerrors.Errorf("piece %d: invalid digest length: %d", i, len(commp2Digest))
+	//	}
+	//
+	//	// Convert digest to merkletree.Node
+	//	var commDs merkletree.Node
+	//	copy(commDs[:], commp2Digest)
+	//
+	//	// Create SegmentDesc entry
+	//	entry := NewDataSegmentIndexEntry(
+	//		(*fr32.Fr32)(&commDs),
+	//		piece.BeginAt,
+	//		piece.RawSize,
+	//	).WithUpdatedChecksum()
+	//
+	//	indexEntries[i] = entry
+	//}
+	//
+	//// Create index from entries
+	//index := &IndexDataV2{}
+	//if err := index.InitFromPieces(indexEntries); err != nil {
+	//	return nil, xerrors.Errorf("failed creating index: %w", err)
+	//}
+	//
+	//// Add index entries to the tree by creating a PieceData for the index
+	//// The index starts at DataSegmentIndexStartOffset(dealSize) in unpadded bytes
+	//indexStartUnpadded := DataSegmentIndexStartOffset(dealSize)
+	//
+	//// Marshal index to bytes (same logic as IndexReader)
+	//indexBytes, err := index.MarshalBinary()
+	//if err != nil {
+	//	return nil, xerrors.Errorf("failed marshaling index: %w", err)
+	//}
+	//
+	//// Pad to 128-byte boundaries for Fr32
+	//if rem := len(indexBytes) % 128; rem != 0 {
+	//	indexBytes = append(indexBytes, make([]byte, 128-rem)...)
+	//}
+	//
+	//// Unpad for reading (to get pre-Fr32 size)
+	//unpaddedSize := len(indexBytes) - len(indexBytes)/128
+	//bNoPad := make([]byte, unpaddedSize)
+	//fr32.Unpad(bNoPad, indexBytes)
+	//
+	//// Calculate the expected unpadded index size (same as IndexReader)
+	//unpaddedIndexSize := int64(MaxIndexEntriesInDeal(dealSize) * EntrySize)
+	//unpaddedIndexSize = unpaddedIndexSize - unpaddedIndexSize/128
+	//paddingSize := unpaddedIndexSize - int64(len(bNoPad))
+	//
+	//// Ensure paddingSize is non-negative
+	//if paddingSize < 0 {
+	//	paddingSize = 0
+	//}
+	//
+	//// Create a reader that includes padding (same as IndexReader)
+	//var indexReader io.Reader = bytes.NewReader(bNoPad)
+	//if paddingSize > 0 {
+	//	indexReader = io.MultiReader(bytes.NewReader(bNoPad), io.LimitReader(zeroReader{}, paddingSize))
+	//}
+	//
+	//// Read all index data including padding
+	//indexUnpaddedBytes, err := io.ReadAll(indexReader)
+	//if err != nil {
+	//	return nil, xerrors.Errorf("failed reading index data: %w", err)
+	//}
+	//
+	//// Create a PieceData for the index
+	//indexPiece := PieceData{
+	//	Reader: bytes.NewReader(indexUnpaddedBytes),
+	//	PieceInfo: PieceInfo{
+	//		BeginAt: indexStartUnpadded,
+	//		RawSize: uint64(len(indexUnpaddedBytes)),
+	//	},
+	//}
+	//
+	//// Recreate readers for all pieces before rebuilding the tree
+	//// This ensures that pieces can be read again when rebuilding the tree
+	//allPieces := make([]PieceData, len(piecesWithNewReaders))
+	//for i, pieceData := range pieceDataList {
+	//	allPieces[i] = PieceData{
+	//		Reader: bytes.NewReader(pieceData),
+	//		PieceInfo: PieceInfo{
+	//			BeginAt: piecesWithNewReaders[i].BeginAt,
+	//			RawSize: piecesWithNewReaders[i].RawSize,
+	//		},
+	//	}
+	//}
+	//allPieces = append(allPieces, indexPiece)
+	//treeWithIndex, err := BuildSectorTree(allPieces, sectorSizePreFr32)
+	//if err != nil {
+	//	return nil, xerrors.Errorf("failed building sector tree with index: %w", err)
+	//}
+	//
+	//agg := AggregateV2{
+	//	DealSize: dealSize,
+	//	Index:    index,
+	//	Tree:     treeWithIndex,
+	//}
+	//
+	//return &agg, nil
+	return nil, nil
 }
 
 // ProofForIndexEntry gathers information required to produce an InclusionProof based on the index
@@ -309,12 +308,6 @@ func (a AggregateV2) IndexReader() (io.Reader, error) {
 	return io.MultiReader(bytes.NewReader(bNoPad), io.LimitReader(zeroReader{}, paddingSize)), nil
 }
 
-// IndexStartPosition returns the expected starting position where the index should be placed
-// in the unpadded units
-func (a AggregateV2) IndexStartPosition() (uint64, error) {
-	return DataSegmentIndexStartOffset(a.DealSize), nil
-}
-
 // IndexSize returns the size of the index
 func (a AggregateV2) IndexSize() (abi.PaddedPieceSize, error) {
 	size := abi.PaddedPieceSize(uint64(MaxIndexEntriesInDeal(a.DealSize)) * EntrySize)
@@ -322,89 +315,6 @@ func (a AggregateV2) IndexSize() (abi.PaddedPieceSize, error) {
 		return abi.PaddedPieceSize(1<<64 - 1), xerrors.Errorf("validating index size %v, report this: %w", size, err)
 	}
 	return size, nil
-}
-
-// AggregateObjectReader creates a reader for the whole aggregate, including the index.
-// The subPieceReaders should be passed in the same order as subdeals in the construction call
-// of the AggregateV2.
-func (a AggregateV2) AggregateObjectReader(subPieceReaders []io.Reader) (io.Reader, error) {
-	if len(subPieceReaders) != len(a.Index.Entries) {
-		return nil, xerrors.Errorf("passed different number of subPieceReaders than subPieces: %d != %d",
-			len(subPieceReaders), len(a.Index.Entries))
-	}
-
-	readers := []io.Reader{}
-	add := func(r ...io.Reader) {
-		readers = append(readers, r...)
-	}
-
-	offset := int64(0)
-	addPiece := func(r io.Reader, targetOffset, targetLength int64) error {
-		if offset > targetOffset {
-			return xerrors.Errorf("current aggregate offset is greater than expected offset from the index. %d > %d",
-				offset, targetOffset)
-		}
-		if offset != targetOffset {
-			add(io.LimitReader(zeroReader{}, int64(targetOffset-offset)))
-		}
-
-		add(io.LimitReader(io.MultiReader(r, zeroReader{}), int64(targetLength)))
-		offset = targetOffset + targetLength
-		return nil
-	}
-
-	var errs error
-	for i := 0; i < len(subPieceReaders); i++ {
-		entry := a.Index.Entry(i)
-		if entry == nil {
-			continue
-		}
-
-		spOffset := entry.UnpaddedOffset()
-		spLen := entry.UnpaddedLength()
-
-		if err := addPiece(subPieceReaders[i], int64(spOffset), int64(spLen)); err != nil {
-			errs = multierror.Append(errs, xerrors.Errorf("subpiece %d: %w", i, err))
-		}
-	}
-
-	{
-		var indexErrs error
-		indexReader, err := a.IndexReader()
-		if err != nil {
-			indexErrs = multierror.Append(indexErrs, err)
-		}
-		indexStart, err := a.IndexStartPosition()
-		if err != nil {
-			indexErrs = multierror.Append(indexErrs, err)
-		}
-		indexLength, err := a.IndexSize()
-		if err != nil {
-			indexErrs = multierror.Append(indexErrs, err)
-		}
-		if indexErrs == nil {
-			if err := addPiece(indexReader, int64(indexStart), int64(indexLength.Unpadded())); err != nil {
-				errs = multierror.Append(errs, err)
-			}
-		} else {
-			errs = multierror.Append(errs, indexErrs)
-		}
-	}
-
-	if errs != nil {
-		return nil, errs
-	}
-
-	return io.MultiReader(readers...), nil
-}
-
-// DataSegmentIndexStartOffset takes in the padded size of the deal and returns the starting offset
-// of data segment index in unpadded units.
-func DataSegmentIndexStartOffset(dealSize abi.PaddedPieceSize) uint64 {
-	mie := MaxIndexEntriesInDeal(dealSize)
-	fromBack := uint64(mie) * uint64(EntrySize)
-	fromBack = fromBack - fromBack/128 // safe because EntrySize = 128 and min(MaxIndexEntriesInDeal(x)) = 4
-	return uint64(dealSize.Unpadded()) - fromBack
 }
 
 // indexAreaStart returns the starting position of the index area in padded bytes

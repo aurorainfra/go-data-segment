@@ -20,9 +20,9 @@ func makeTestEntry(t *testing.T, commP *fr32.Fr32, offset, rawSize uint64) *Segm
 }
 
 func makeTestIndex(t *testing.T, entries []*SegmentDesc) *IndexDataV2 {
-	index := &IndexDataV2{}
-	err := index.InitFromPieces(entries)
-	require.NoError(t, err)
+	index := &IndexDataV2{
+		entries,
+	}
 	return index
 }
 
@@ -40,13 +40,6 @@ func TestInitFromPieces(t *testing.T) {
 	assert.Equal(t, 2, index.NumPieces())
 	assert.Equal(t, entry1, index.Entry(0))
 	assert.Equal(t, entry2, index.Entry(1))
-}
-
-func TestInitFromPieces_Empty(t *testing.T) {
-	index := &IndexDataV2{}
-	err := index.InitFromPieces([]*SegmentDesc{})
-	require.NoError(t, err)
-	assert.Equal(t, 0, index.NumPieces())
 }
 
 func TestNumPieces(t *testing.T) {
@@ -251,14 +244,6 @@ func TestIndexSize(t *testing.T) {
 	assert.Equal(t, expectedSize, index.IndexSize())
 }
 
-func TestIndexSize_Empty(t *testing.T) {
-	index := &IndexDataV2{}
-	err := index.InitFromPieces([]*SegmentDesc{})
-	require.NoError(t, err)
-
-	assert.Equal(t, uint64(0), index.IndexSize())
-}
-
 func TestMaxIndexEntriesInDeal(t *testing.T) {
 	// Test with small deal size
 	smallDeal := abi.PaddedPieceSize(1024)
@@ -277,51 +262,6 @@ func TestMaxIndexEntriesInDeal(t *testing.T) {
 
 	// Verify it's always at least NodesPerEntry
 	assert.GreaterOrEqual(t, maxEntries, uint(NodesPerEntry))
-}
-
-func TestSegmentRoot(t *testing.T) {
-	// Test cases for SegmentRoot
-	tests := []struct {
-		name          string
-		treeDepth     int
-		segmentSize   uint64
-		segmentOffset uint64
-		expectedLevel int
-		expectedIdx   uint64
-	}{
-		{
-			name:          "small segment at start",
-			treeDepth:     10,
-			segmentSize:   1,
-			segmentOffset: 0,
-			expectedLevel: 9, // treeDepth - log2(1) - 1 = 10 - 0 - 1 = 9
-			expectedIdx:   0,
-		},
-		{
-			name:          "medium segment",
-			treeDepth:     10,
-			segmentSize:   4,
-			segmentOffset: 0,
-			expectedLevel: 7, // treeDepth - log2(4) - 1 = 10 - 2 - 1 = 7
-			expectedIdx:   0,
-		},
-		{
-			name:          "segment with offset",
-			treeDepth:     10,
-			segmentSize:   2,
-			segmentOffset: 4,
-			expectedLevel: 8, // treeDepth - log2(2) - 1 = 10 - 1 - 1 = 8
-			expectedIdx:   2, // 4 >> 1 = 2
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			level, idx := SegmentRoot(tt.treeDepth, tt.segmentSize, tt.segmentOffset)
-			assert.Equal(t, tt.expectedLevel, level)
-			assert.Equal(t, tt.expectedIdx, idx)
-		})
-	}
 }
 
 func TestIndexSerializationRoundTrip(t *testing.T) {
@@ -448,13 +388,6 @@ func TestIndexDataV2_ImplementsPieceIndex(t *testing.T) {
 
 	// This test will fail at compile time if IndexDataV2 doesn't implement PieceIndex
 	// So if we get here, the implementation is correct
-}
-
-func TestIndexDataV2_ImplementsBinaryMarshaler(t *testing.T) {
-	// Verify that IndexDataV2 implements encoding.BinaryMarshaler
-	var _ encoding.BinaryMarshaler = IndexDataV2{}
-
-	// This test will fail at compile time if IndexDataV2 doesn't implement BinaryMarshaler
 }
 
 func TestIndexDataV2_ImplementsBinaryUnmarshaler(t *testing.T) {
