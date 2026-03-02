@@ -120,7 +120,7 @@ func (id *IndexDataV2) BuildFromSector(sector io.ReaderAt, blobOffsets []int64, 
 				commP, _, _ := cal.Digest()
 				resultCh <- blobResult{
 					index:   t.index,
-					segment: NewDataSegmentIndexEntry((*fr32.Fr32)(commP), uint64(t.offset), uint64(t.size)),
+					segment: NewDataSegmentIndexEntry((*fr32.Fr32)(commP), uint64(t.offset), uint64(t.size)).WithUpdatedChecksum(),
 				}
 			}
 		}()

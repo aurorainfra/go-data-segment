@@ -90,10 +90,10 @@ func (sd SegmentDesc) PieceCIDV2() (cid.Cid, error) {
 //   - dealOffset: Offset of this piece within the larger deal (for context)
 //
 // This function uses commp2 library to compute offset-aware CommP v2.
-	// For misaligned pieces, commp2 computes the CommP tree with:
-	// - Interior leaves from the actual data
-	// - Zero commitments for padding areas outside piece boundaries
-	// - Offset-aware tree shape
+// For misaligned pieces, commp2 computes the CommP tree with:
+// - Interior leaves from the actual data
+// - Zero commitments for padding areas outside piece boundaries
+// - Offset-aware tree shape
 //
 // Note: dealOffset parameter is provided for context but the actual offset used
 // is sd.Offset, which represents the piece's offset in the sector/deal.
@@ -104,7 +104,7 @@ func (sd SegmentDesc) ComputePieceCIDV2WithData(dataReader io.Reader, dealOffset
 
 	// Use commp2 to calculate the CommP for this piece at its offset
 	calc := &commp2.Calc{}
-	
+
 	// Set the offset using BeginAt (sd.Offset is the pre-Fr32-padding offset)
 	if err := calc.BeginAt(sd.Offset); err != nil {
 		return cid.Undef, xerrors.Errorf("failed to set BeginAt offset %d: %w", sd.Offset, err)
@@ -115,7 +115,7 @@ func (sd SegmentDesc) ComputePieceCIDV2WithData(dataReader io.Reader, dealOffset
 	limitedReader := io.LimitReader(dataReader, int64(sd.RawSize))
 	buf := make([]byte, 32*1024) // 32KB buffer for efficient reading
 	totalRead := uint64(0)
-	
+
 	for totalRead < sd.RawSize {
 		n, err := limitedReader.Read(buf)
 		if err != nil && err != io.EOF {
@@ -124,7 +124,7 @@ func (sd SegmentDesc) ComputePieceCIDV2WithData(dataReader io.Reader, dealOffset
 		if n == 0 {
 			break
 		}
-		
+
 		// Write the data to commp2 calculator
 		written, err := calc.Write(buf[:n])
 		if err != nil {
@@ -133,10 +133,10 @@ func (sd SegmentDesc) ComputePieceCIDV2WithData(dataReader io.Reader, dealOffset
 		if written != n {
 			return cid.Undef, xerrors.Errorf("incomplete write to commp2: wrote %d of %d bytes", written, n)
 		}
-		
+
 		totalRead += uint64(n)
 	}
-	
+
 	// Verify we read exactly RawSize bytes
 	if totalRead != sd.RawSize {
 		return cid.Undef, xerrors.Errorf("data size mismatch: expected %d bytes, read %d bytes", sd.RawSize, totalRead)
@@ -268,24 +268,24 @@ func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, rawSize uint64) *
 	// Fr32 padding: post-Fr32 = ceil(pre-Fr32 * 128 / 127)
 	// We need: post-Fr32 >= rawSize (to contain the data)
 	// And: post-Fr32 should be aligned to NodeSize boundaries
-	
+
 	// Start by computing minimum post-Fr32 size needed
 	minPostFr32Size := rawSize
 	if minPostFr32Size%merkletree.NodeSize != 0 {
 		minPostFr32Size = ((minPostFr32Size / merkletree.NodeSize) + 1) * merkletree.NodeSize
 	}
-	
+
 	// Convert back to pre-Fr32 size
 	// post-Fr32 = ceil(pre-Fr32 * 128 / 127)
 	// So: pre-Fr32 >= (post-Fr32 * 127 + 126) / 128
 	// We use the minimum pre-Fr32 size that gives us the required post-Fr32 size
 	size := (minPostFr32Size*127 + 126) / 128
-	
+
 	// Ensure Size is at least RawSize (should always be true, but check anyway)
 	if size < rawSize {
 		size = rawSize
 	}
-	
+
 	return &SegmentDesc{
 		CommDs:     *(*merkletree.Node)(CommP),
 		Offset:     offset,
@@ -296,7 +296,7 @@ func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, rawSize uint64) *
 }
 
 func (sd *SegmentDesc) computeChecksum() [ChecksumSize]byte {
-	sdCopy := sd
+	sdCopy := *sd
 	sdCopy.Checksum = [ChecksumSize]byte{}
 
 	toHash := sdCopy.SerializeFr32()
