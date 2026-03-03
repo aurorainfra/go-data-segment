@@ -297,8 +297,9 @@ func (id *IndexDataV2) Entry(idx int) *SegmentDesc {
 	return id.Entries[idx]
 }
 
-// Search finds the index of a segment by its PieceCID
-// Returns -1 if not found
+// Search finds the index of a segment by its Piece CID v1 (CommDS).
+// Returns -1 if not found.
+// For lookup by Piece CID v2 use SearchByPieceCIDV2.
 func (id *IndexDataV2) Search(c cid.Cid) int {
 	comm, err := commcid.CIDToPieceCommitmentV1(c)
 	if err != nil {
@@ -306,6 +307,24 @@ func (id *IndexDataV2) Search(c cid.Cid) int {
 	}
 	for i, e := range id.Entries {
 		if e != nil && bytes.Equal(e.CommDs[:], comm[:]) {
+			return i
+		}
+	}
+	return -1
+}
+
+// SearchByPieceCIDV2 finds the index of a segment by its Piece CID v2 (FRC-0069).
+// Returns -1 if not found. Per FRC-1216, retrieval is supported by both CommDS and Piece CID v2.
+func (id *IndexDataV2) SearchByPieceCIDV2(pieceCIDV2 cid.Cid) int {
+	for i, e := range id.Entries {
+		if e == nil {
+			continue
+		}
+		c2, err := e.PieceCIDV2()
+		if err != nil {
+			continue
+		}
+		if c2.Equals(pieceCIDV2) {
 			return i
 		}
 	}
@@ -322,7 +341,7 @@ func (id *IndexDataV2) ListPieces() []*SegmentDesc {
 	return entries
 }
 
-// IndexSize returns the size of the index. Defined to be number of entries * 64 bytes
+// IndexSize returns the size of the index. Defined to be number of entries * EntrySize (128 bytes for v2).
 func (i *IndexDataV2) IndexSize() uint64 {
 	return uint64(i.NumPieces()) * uint64(EntrySize)
 }

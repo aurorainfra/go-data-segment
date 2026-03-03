@@ -398,7 +398,8 @@ func (sd *SegmentDesc) Validate() error {
 
 // ==============================
 
-var lengthBufSegmentDesc = []byte{133}
+// CBOR array length: 10 fields for v2 (CommDs, Offset, Size, RawSize, Multicodec, MulticodecDependent, ACLType, ACLData, Reserved, Checksum)
+var lengthBufSegmentDesc = []byte{0x8a}
 
 func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
 	if t == nil {
@@ -415,27 +416,42 @@ func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
 	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.CommDs))); err != nil {
 		return err
 	}
-
 	if _, err := cw.Write(t.CommDs[:]); err != nil {
 		return err
 	}
-
 	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Offset)); err != nil {
 		return err
 	}
-
 	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Size)); err != nil {
 		return err
 	}
-
 	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.RawSize)); err != nil {
 		return err
 	}
-
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Multicodec)); err != nil {
+		return err
+	}
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.MulticodecDependent))); err != nil {
+		return err
+	}
+	if _, err := cw.Write(t.MulticodecDependent[:]); err != nil {
+		return err
+	}
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.ACLType)); err != nil {
+		return err
+	}
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.ACLData)); err != nil {
+		return err
+	}
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.Reserved))); err != nil {
+		return err
+	}
+	if _, err := cw.Write(t.Reserved[:]); err != nil {
+		return err
+	}
 	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.Checksum))); err != nil {
 		return err
 	}
-
 	if _, err := cw.Write(t.Checksum[:]); err != nil {
 		return err
 	}
@@ -460,12 +476,12 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 	if maj != cbg.MajArray {
 		return fmt.Errorf("cbor input should be of type array")
 	}
-
-	if extra != 5 {
-		return fmt.Errorf("cbor input had wrong number of fields")
+	numFields := extra
+	if numFields != 5 && numFields != 10 {
+		return fmt.Errorf("cbor input had wrong number of fields (expected 5 or 10, got %d)", numFields)
 	}
 
-	// t.CommDs (merkletree.Node) (array)
+	// t.CommDs (merkletree.Node)
 
 	maj, extra, err = cr.ReadHeader()
 	if err != nil {
@@ -540,6 +556,64 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 
 	if _, err := io.ReadFull(cr, t.Checksum[:]); err != nil {
 		return err
+	}
+	// Legacy 5-field format: set v2 defaults and return
+	if numFields == 5 {
+		t.Multicodec = MulticodecRaw
+		return nil
+	}
+	// t.Multicodec
+	maj, extra, err = cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	if maj != cbg.MajUnsignedInt {
+		return fmt.Errorf("wrong type for multicodec")
+	}
+	t.Multicodec = uint64(extra)
+	// t.MulticodecDependent (32 bytes)
+	maj, extra, err = cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	if maj != cbg.MajByteString || extra != 32 {
+		return fmt.Errorf("multicodecDependent: expected byte array of 32, got type/len %d/%d", maj, extra)
+	}
+	if _, err := io.ReadFull(cr, t.MulticodecDependent[:]); err != nil {
+		return err
+	}
+	// t.ACLType
+	maj, extra, err = cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	if maj != cbg.MajUnsignedInt || extra > 0xff {
+		return fmt.Errorf("wrong type or value for aclType")
+	}
+	t.ACLType = uint8(extra)
+	// t.ACLData
+	maj, extra, err = cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	if maj != cbg.MajUnsignedInt {
+		return fmt.Errorf("wrong type for aclData")
+	}
+	t.ACLData = uint64(extra)
+	// t.Reserved (14 bytes)
+	maj, extra, err = cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	reservedLen := uint64(len(t.Reserved))
+	if maj != cbg.MajByteString || extra > reservedLen {
+		return fmt.Errorf("reserved: expected byte array of at most %d", len(t.Reserved))
+	}
+	n := int(extra)
+	if n > 0 {
+		if _, err := io.ReadFull(cr, t.Reserved[:n]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
