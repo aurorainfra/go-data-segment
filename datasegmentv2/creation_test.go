@@ -673,104 +673,44 @@ func TestAggregateV2_PieceCommP_Consistency_Misaligned(t *testing.T) {
 	}
 }
 
-// TestSegmentDesc_ComputePieceCIDV2WithData tests ComputePieceCIDV2WithData function
-func TestSegmentDesc_ComputePieceCIDV2WithData(t *testing.T) {
-	// Test with aligned piece (offset = 0)
-	t.Run("AlignedPiece", func(t *testing.T) {
-		pieceData := makeTestDataCreation(1024)
-
-		// Create a SegmentDesc with offset 0
-		entry := NewDataSegmentIndexEntry(
-			(*fr32.Fr32)(&merkletree.Node{}), // CommDs will be computed
-			0,                                // Offset = 0 (aligned)
-			1024,                             // RawSize
-		)
-
-		// Calculate CommP using commp2 directly for comparison
-		calc := &commp2.Calc{}
-		require.NoError(t, calc.BeginAt(0))
-		_, err := calc.Write(pieceData)
-		require.NoError(t, err)
-		expectedDigest, _, err := calc.Digest()
-		require.NoError(t, err)
-		expectedCID, err := commcid.PieceCommitmentV1ToCID(expectedDigest)
-		require.NoError(t, err)
-
-		// Compute Piece CID v2 using ComputePieceCIDV2WithData
-		pieceCID, err := entry.ComputePieceCIDV2WithData(bytes.NewReader(pieceData), 0)
+// TestSegmentDesc_PieceCIDV2 tests PieceCIDV2() which uses DataCommitmentToPieceCidv2(CommDs, RawSize).
+func TestSegmentDesc_PieceCIDV2(t *testing.T) {
+	// Valid entry: 32-byte CommDs, RawSize >= 127
+	t.Run("Valid", func(t *testing.T) {
+		var commD [32]byte
+		for i := range commD {
+			commD[i] = byte(i)
+		}
+		entry := NewDataSegmentIndexEntry((*fr32.Fr32)(&commD), 0, 1024)
+		require.NotNil(t, entry)
+		pieceCID, err := entry.PieceCIDV2()
 		require.NoError(t, err)
 		assert.False(t, pieceCID.Equals(cid.Undef))
-
-		// Should match the expected CID
-		assert.True(t, pieceCID.Equals(expectedCID),
-			"Piece CID v2 should match commp2 calculation\n"+
-				"  Expected: %s\n"+
-				"  Got:      %s",
-			expectedCID.String(), pieceCID.String())
+		// Must match direct call to DataCommitmentToPieceCidv2
+		expected, err := commcid.DataCommitmentToPieceCidv2(entry.CommDs[:], entry.RawSize)
+		require.NoError(t, err)
+		assert.True(t, pieceCID.Equals(expected), "PieceCIDV2() should equal DataCommitmentToPieceCidv2(CommDs, RawSize)")
 	})
 
-	// Test with misaligned piece (offset > 0)
-	t.Run("MisalignedPiece", func(t *testing.T) {
-		pieceData := makeTestDataCreation(512)
-		offset := uint64(127) // Non-aligned offset
-
-		// Create a SegmentDesc with non-zero offset
-		entry := NewDataSegmentIndexEntry(
-			(*fr32.Fr32)(&merkletree.Node{}), // CommDs will be computed
-			offset,                           // Offset > 0 (misaligned)
-			512,                              // RawSize
-		)
-
-		// Calculate CommP using commp2 directly for comparison
-		calc := &commp2.Calc{}
-		require.NoError(t, calc.BeginAt(offset))
-		_, err := calc.Write(pieceData)
-		require.NoError(t, err)
-		expectedDigest, _, err := calc.Digest()
-		require.NoError(t, err)
-		expectedCID, err := commcid.PieceCommitmentV1ToCID(expectedDigest)
-		require.NoError(t, err)
-
-		// Compute Piece CID v2 using ComputePieceCIDV2WithData
-		pieceCID, err := entry.ComputePieceCIDV2WithData(bytes.NewReader(pieceData), 0)
+	t.Run("NonZeroOffset", func(t *testing.T) {
+		var commD [32]byte
+		commD[0] = 1
+		entry := NewDataSegmentIndexEntry((*fr32.Fr32)(&commD), 127, 512)
+		require.NotNil(t, entry)
+		pieceCID, err := entry.PieceCIDV2()
 		require.NoError(t, err)
 		assert.False(t, pieceCID.Equals(cid.Undef))
-
-		// Should match the expected CID
-		assert.True(t, pieceCID.Equals(expectedCID),
-			"Piece CID v2 should match commp2 calculation for misaligned piece\n"+
-				"  Expected: %s\n"+
-				"  Got:      %s\n"+
-				"  Offset:  %d",
-			expectedCID.String(), pieceCID.String(), offset)
+		expected, err := commcid.DataCommitmentToPieceCidv2(entry.CommDs[:], entry.RawSize)
+		require.NoError(t, err)
+		assert.True(t, pieceCID.Equals(expected))
 	})
 
-	// Test error cases
-	t.Run("ZeroRawSize", func(t *testing.T) {
-		entry := NewDataSegmentIndexEntry(
-			(*fr32.Fr32)(&merkletree.Node{}),
-			0,
-			0, // Zero RawSize
-		)
-
-		_, err := entry.ComputePieceCIDV2WithData(bytes.NewReader([]byte{}), 0)
+	// RawSize < 127 is rejected by DataCommitmentToPieceCidv2
+	t.Run("RawSizeTooSmall", func(t *testing.T) {
+		var commD [32]byte
+		entry := NewDataSegmentIndexEntry((*fr32.Fr32)(&commD), 0, 100)
+		require.NotNil(t, entry)
+		_, err := entry.PieceCIDV2()
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "RawSize cannot be zero")
-	})
-
-	// Test with data size mismatch
-	t.Run("DataSizeMismatch", func(t *testing.T) {
-		pieceData := makeTestDataCreation(1024)
-
-		entry := NewDataSegmentIndexEntry(
-			(*fr32.Fr32)(&merkletree.Node{}),
-			0,
-			2048, // RawSize larger than actual data
-		)
-
-		// Should fail because we can't read enough data
-		_, err := entry.ComputePieceCIDV2WithData(bytes.NewReader(pieceData), 0)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "data size mismatch")
 	})
 }

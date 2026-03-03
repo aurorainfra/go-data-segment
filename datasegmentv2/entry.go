@@ -9,11 +9,10 @@ import (
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
 	commcid "github.com/filecoin-project/go-fil-commcid"
-	commp2 "github.com/filecoin-project/go-fil-commp-hashhash/commp2"
+	"golang.org/x/xerrors"
 
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
-	"golang.org/x/xerrors"
 	"io"
 )
 
@@ -40,8 +39,6 @@ type SegmentDesc struct {
 	Offset uint64 // pre-Fr32-padding offset from start of deal
 
 	// Size is the total size including trailing padding (pre-Fr32-padding)
-	// RawSize is the actual data size before padding (pre-Fr32-padding)
-	// Height is computed from Size: height = log2(Size / NodeSize)
 	Size    uint64
 	RawSize uint64
 
@@ -62,103 +59,10 @@ func (sd SegmentDesc) PieceCID() cid.Cid {
 	return c
 }
 
-// PieceCIDV2 computes the PieceCID v2 for this segment
-// According to FRC-1216 and FRC-0069:
-// - For aligned pieces (offset aligned to piece start), Piece CID v2 equals Piece CID v1
-// - For misaligned pieces, Piece CID v2 requires offset-aware CommP computation using commp2
-//
-// This method returns Piece CID v1 for aligned pieces. For misaligned pieces,
-// use ComputePieceCIDV2WithData which requires access to the raw data.
+// PieceCIDV2 computes the Piece CID v2 (FRC-0069) for this segment using the index entry's
+// CommDs and RawSize, via commcid.DataCommitmentToPieceCidv2.
 func (sd SegmentDesc) PieceCIDV2() (cid.Cid, error) {
-	// For aligned pieces (offset == 0 or aligned to piece boundary), v2 equals v1
-	// According to FRC-1216 discussion, if offset is aligned to piece start,
-	// CommP v2 matches CommP v1
-	if sd.Offset == 0 {
-		return sd.PieceCID(), nil
-	}
-
-	// For misaligned pieces, we cannot compute v2 without the raw data
-	// Use ComputePieceCIDV2WithData instead
-	return cid.Undef, xerrors.Errorf("PieceCIDV2 for misaligned pieces requires raw data access, use ComputePieceCIDV2WithData")
-}
-
-// ComputePieceCIDV2WithData computes Piece CID v2 for misaligned pieces
-// using the commp2 library with access to raw data
-//
-// Parameters:
-//   - dataReader: Reader for the raw piece data (pre-Fr32-padding, size = RawSize)
-//   - dealOffset: Offset of this piece within the larger deal (for context)
-//
-// This function uses commp2 library to compute offset-aware CommP v2.
-// For misaligned pieces, commp2 computes the CommP tree with:
-// - Interior leaves from the actual data
-// - Zero commitments for padding areas outside piece boundaries
-// - Offset-aware tree shape
-//
-// Note: dealOffset parameter is provided for context but the actual offset used
-// is sd.Offset, which represents the piece's offset in the sector/deal.
-func (sd SegmentDesc) ComputePieceCIDV2WithData(dataReader io.Reader, dealOffset uint64) (cid.Cid, error) {
-	if sd.RawSize == 0 {
-		return cid.Undef, xerrors.Errorf("RawSize cannot be zero")
-	}
-
-	// Use commp2 to calculate the CommP for this piece at its offset
-	calc := &commp2.Calc{}
-
-	// Set the offset using BeginAt (sd.Offset is the pre-Fr32-padding offset)
-	if err := calc.BeginAt(sd.Offset); err != nil {
-		return cid.Undef, xerrors.Errorf("failed to set BeginAt offset %d: %w", sd.Offset, err)
-	}
-
-	// Read and write the piece data
-	// Limit the reader to RawSize bytes to ensure we don't read more than expected
-	limitedReader := io.LimitReader(dataReader, int64(sd.RawSize))
-	buf := make([]byte, 32*1024) // 32KB buffer for efficient reading
-	totalRead := uint64(0)
-
-	for totalRead < sd.RawSize {
-		n, err := limitedReader.Read(buf)
-		if err != nil && err != io.EOF {
-			return cid.Undef, xerrors.Errorf("failed to read piece data: %w", err)
-		}
-		if n == 0 {
-			break
-		}
-
-		// Write the data to commp2 calculator
-		written, err := calc.Write(buf[:n])
-		if err != nil {
-			return cid.Undef, xerrors.Errorf("failed to write data to commp2: %w", err)
-		}
-		if written != n {
-			return cid.Undef, xerrors.Errorf("incomplete write to commp2: wrote %d of %d bytes", written, n)
-		}
-
-		totalRead += uint64(n)
-	}
-
-	// Verify we read exactly RawSize bytes
-	if totalRead != sd.RawSize {
-		return cid.Undef, xerrors.Errorf("data size mismatch: expected %d bytes, read %d bytes", sd.RawSize, totalRead)
-	}
-
-	// Get the CommP digest from commp2
-	commp2Digest, _, err := calc.Digest()
-	if err != nil {
-		return cid.Undef, xerrors.Errorf("failed to get digest from commp2: %w", err)
-	}
-	if len(commp2Digest) != 32 {
-		return cid.Undef, xerrors.Errorf("invalid digest length: expected 32, got %d", len(commp2Digest))
-	}
-
-	// Convert digest to Piece CID v1 (which is the same as Piece CID v2 for CommP)
-	// According to FRC-1216, Piece CID v2 uses the same CommP calculation as v1
-	pieceCID, err := commcid.PieceCommitmentV1ToCID(commp2Digest)
-	if err != nil {
-		return cid.Undef, xerrors.Errorf("failed to convert digest to CID: %w", err)
-	}
-
-	return pieceCID, nil
+	return commcid.DataCommitmentToPieceCidv2(sd.CommDs[:], sd.RawSize)
 }
 
 // UnpaddedOffset returns unpadded offset of the sub-deal relative to the deal start
@@ -196,21 +100,6 @@ func (sd SegmentDesc) Height() uint8 {
 	}
 	// For v2, Size doesn't need to be power-of-two
 	// We compute the height needed to contain this size (which may not be power-of-two)
-	return uint8(util.Log2Ceil(leafCount))
-}
-
-// computeHeightFromSize calculates the tree height needed for a given size
-// For v2, size doesn't need to be power-of-two, so we just compute the height
-// needed to contain the actual size
-func computeHeightFromSize(size uint64) uint8 {
-	if size == 0 {
-		return 0
-	}
-	leafCount := size / merkletree.NodeSize
-	if leafCount == 0 {
-		return 0
-	}
-	// For v2, we don't require power-of-two, just compute the height needed
 	return uint8(util.Log2Ceil(leafCount))
 }
 
@@ -321,6 +210,7 @@ func (sd *SegmentDesc) MarshalBinary() ([]byte, error) {
 
 func (sd *SegmentDesc) UnmarshalBinary(data []byte) error {
 	if len(data) != EntrySize {
+
 		return xerrors.Errorf("invalid segment description size: expected %d, got %d", EntrySize, len(data))
 	}
 	le := binary.LittleEndian
@@ -464,10 +354,14 @@ func (sd *SegmentDesc) Validate() error {
 		return validationError("multicodec must be 0x55 (Raw) or 0x0202 (CAR)")
 	}
 
-	// Validate MulticodecDependent is zero for Raw and CAR codecs
+	// Validate MulticodecDependent: zero for Raw/CAR unless Reserved[7]=1 (Data CID extension).
+	// Per FRC-1216, MulticodecDependent is for "multicodec-specific metadata"; when Reserved[7]=1
+	// we use it to store the 32-byte digest of the optional Data CID (user-submitted CID for retrieval).
 	var zeroNode merkletree.Node
 	if sd.MulticodecDependent != zeroNode {
-		return validationError("multicodecDependent must be zero for Raw and CAR codecs")
+		if sd.Reserved[7] != 1 {
+			return validationError("multicodecDependent must be zero for Raw and CAR codecs unless Reserved[7]=1 (Data CID)")
+		}
 	}
 
 	// Validate ACLType and ACLData
@@ -477,10 +371,22 @@ func (sd *SegmentDesc) Validate() error {
 		}
 	}
 
-	// Validate Reserved field is zero
+	// Validate Reserved: [0:7] and [9:14] must be zero; [7] = hasDataCid (0 or 1), [8] = dataCidEncoding (0..3)
 	for i := range sd.Reserved {
+		if i == 7 {
+			if sd.Reserved[7] > 1 {
+				return validationError("reserved[7] (hasDataCid) must be 0 or 1")
+			}
+			continue
+		}
+		if i == 8 {
+			if sd.Reserved[8] > 3 {
+				return validationError("reserved[8] (dataCidEncoding) must be 0..3")
+			}
+			continue
+		}
 		if sd.Reserved[i] != 0 {
-			return validationError("reserved field must be zero")
+			return validationError("reserved field must be zero except [7] and [8]")
 		}
 	}
 
