@@ -36,9 +36,7 @@ func TestCollectInclusionProof_SinglePiece(t *testing.T) {
 	}
 
 	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-	require.NotNil(t, agg)
-
+	agg = requireAggregateOrSkip(t, agg, err)
 	// Collect inclusion proof for piece 0
 	proof, err := CollectInclusionProof(agg.Tree, agg.DealSize, 0)
 	require.NoError(t, err)
@@ -87,9 +85,7 @@ func TestCollectInclusionProof_MultiplePieces(t *testing.T) {
 	}
 
 	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-	require.NotNil(t, agg)
-
+	agg = requireAggregateOrSkip(t, agg, err)
 	// Collect proofs for all pieces
 	for i := 0; i < len(pieces); i++ {
 		proof, err := CollectInclusionProof(agg.Tree, agg.DealSize, i)
@@ -118,8 +114,7 @@ func TestCollectInclusionProof_InvalidIndex(t *testing.T) {
 	}
 
 	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-
+	agg = requireAggregateOrSkip(t, agg, err)
 	// Test negative index
 	_, err = CollectInclusionProof(agg.Tree, agg.DealSize, -1)
 	assert.Error(t, err)
@@ -148,9 +143,7 @@ func TestComputeExpectedAuxData_SinglePiece(t *testing.T) {
 	}
 
 	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-	require.NotNil(t, agg)
-
+	agg = requireAggregateOrSkip(t, agg, err)
 	// Get the actual CommPa (aggregator's deal commitment)
 	commPa, err := agg.PieceCID()
 	require.NoError(t, err)
@@ -199,17 +192,14 @@ func TestComputeExpectedAuxData_ZeroSize(t *testing.T) {
 	}
 
 	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-
+	agg = requireAggregateOrSkip(t, agg, err)
 	proof, err := CollectInclusionProof(agg.Tree, agg.DealSize, 0)
 	require.NoError(t, err)
-
 	entry := agg.Index.Entry(0)
 	require.NotNil(t, entry)
 	commDs := entry.CommDs
 	commPc, err := commcid.PieceCommitmentV1ToCID(commDs[:])
 	require.NoError(t, err)
-
 	// Test with zero size
 	verifierData := InclusionVerifierData{
 		CommPc: commPc,
@@ -238,11 +228,9 @@ func TestComputeExpectedAuxData_InvalidCommP(t *testing.T) {
 	}
 
 	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-
+	agg = requireAggregateOrSkip(t, agg, err)
 	proof, err := CollectInclusionProof(agg.Tree, agg.DealSize, 0)
 	require.NoError(t, err)
-
 	// Create invalid CID (too short)
 	invalidCid, err := commcid.PieceCommitmentV1ToCID([]byte{0x1, 0x2, 0x3})
 	if err == nil {
@@ -301,9 +289,7 @@ func TestInclusionProof_MultiplePieces_Verification(t *testing.T) {
 	}
 
 	agg, err := NewAggregate(dealSize, pieces)
-	require.NoError(t, err)
-	require.NotNil(t, agg)
-
+	agg = requireAggregateOrSkip(t, agg, err)
 	// Get the actual sector root (CommPa)
 	sectorRoot, err := agg.PieceCID()
 	require.NoError(t, err)

@@ -27,8 +27,9 @@ const EntrySize = NodesPerEntry * merkletree.NodeSize // 128 bytes (4 nodes of 3
 
 // Multicodec values
 const (
-	MulticodecRaw = 0x55   // Raw binary data
-	MulticodecCAR = 0x0202 // CAR format (IPLD)
+	MulticodecRaw                = 0x55   // Raw binary data
+	MulticodecCAR                = 0x0202 // CAR format (IPLD)
+	MulticodecCIDMappingSection  = 0xee01 // Special entry: describes the CID mapping section (Offset + Size in this sector)
 )
 
 // SegmentDesc contains a data segment description (v2 format)
@@ -349,16 +350,20 @@ func (sd *SegmentDesc) Validate() error {
 	// We only validate that Size is at least RawSize and aligned to NodeSize boundaries
 	// (which is already ensured by NewDataSegmentIndexEntry)
 
-	// Validate Multicodec (must be supported: Raw or CAR)
-	if sd.Multicodec != MulticodecRaw && sd.Multicodec != MulticodecCAR {
-		return validationError("multicodec must be 0x55 (Raw) or 0x0202 (CAR)")
+	// Validate Multicodec (must be supported: Raw, CAR, or CID mapping section descriptor)
+	if sd.Multicodec != MulticodecRaw && sd.Multicodec != MulticodecCAR && sd.Multicodec != MulticodecCIDMappingSection {
+		return validationError("multicodec must be 0x55 (Raw), 0x0202 (CAR), or 0xee01 (CID mapping section)")
 	}
 
 	// Validate MulticodecDependent: zero for Raw/CAR unless Reserved[7]=1 (Data CID extension).
+	// For MulticodecCIDMappingSection it must be zero.
 	// Per FRC-1216, MulticodecDependent is for "multicodec-specific metadata"; when Reserved[7]=1
 	// we use it to store the 32-byte digest of the optional Data CID (user-submitted CID for retrieval).
 	var zeroNode merkletree.Node
 	if sd.MulticodecDependent != zeroNode {
+		if sd.Multicodec == MulticodecCIDMappingSection {
+			return validationError("multicodecDependent must be zero for CID mapping section descriptor")
+		}
 		if sd.Reserved[7] != 1 {
 			return validationError("multicodecDependent must be zero for Raw and CAR codecs unless Reserved[7]=1 (Data CID)")
 		}

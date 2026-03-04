@@ -2,6 +2,7 @@ package datasegmentv2
 
 import (
 	"encoding"
+	"encoding/binary"
 	"testing"
 
 	"github.com/filecoin-project/go-data-segment/fr32"
@@ -20,10 +21,7 @@ func makeTestEntry(t *testing.T, commP *fr32.Fr32, offset, rawSize uint64) *Segm
 }
 
 func makeTestIndex(t *testing.T, entries []*SegmentDesc) *IndexDataV2 {
-	index := &IndexDataV2{
-		entries,
-	}
-	return index
+	return &IndexDataV2{Entries: entries}
 }
 
 func TestInitFromPieces(t *testing.T) {
@@ -162,9 +160,11 @@ func TestMarshalBinary(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, data)
 
-	// Check size: 2 entries * EntrySize (128 bytes)
-	expectedSize := 2 * EntrySize
-	assert.Equal(t, expectedSize, len(data))
+	// Layout: [CID mapping section (min 16 bytes)][index section]. Index has 2 blob entries + 1 special (CID mapping descriptor).
+	mappingMinSize := len(CIDMappingMagic) + 8 // 16
+	indexEntries := 3
+	expectedMinSize := mappingMinSize + indexEntries*EntrySize
+	assert.GreaterOrEqual(t, len(data), expectedMinSize)
 }
 
 func TestUnmarshalBinary(t *testing.T) {
@@ -177,20 +177,17 @@ func TestUnmarshalBinary(t *testing.T) {
 	entries := []*SegmentDesc{entry1, entry2}
 	index := makeTestIndex(t, entries)
 
-	// Marshal
+	// Marshal (produces mapping + index; index has 2 blob entries + 1 special CID mapping entry)
 	data, err := index.MarshalBinary()
 	require.NoError(t, err)
 
-	// Unmarshal
 	var decoded IndexDataV2
 	err = decoded.UnmarshalBinary(data)
 	require.NoError(t, err)
 
-	// Verify
-	assert.Equal(t, index.NumPieces(), decoded.NumPieces())
-	assert.Equal(t, 2, decoded.NumPieces())
+	// Decoded index has 3 entries: 2 blob + 1 special
+	assert.Equal(t, 3, decoded.NumPieces())
 
-	// Compare entries
 	decodedEntry1 := decoded.Entry(0)
 	decodedEntry2 := decoded.Entry(1)
 
@@ -206,26 +203,37 @@ func TestUnmarshalBinary(t *testing.T) {
 	assert.Equal(t, entry2.Offset, decodedEntry2.Offset)
 	assert.Equal(t, entry2.Size, decodedEntry2.Size)
 	assert.Equal(t, entry2.RawSize, decodedEntry2.RawSize)
+
+	// Third entry is the CID mapping section descriptor
+	special := decoded.Entry(2)
+	require.NotNil(t, special)
+	assert.Equal(t, uint64(MulticodecCIDMappingSection), special.Multicodec)
 }
 
 func TestUnmarshalBinary_InvalidSize(t *testing.T) {
 	var index IndexDataV2
 
-	// Test with data that's not a multiple of EntrySize
-	invalidData := make([]byte, EntrySize+1)
+	// Valid mapping header (magic + size=16) then index with invalid length (not multiple of EntrySize)
+	invalidData := make([]byte, 0, 16+EntrySize+1)
+	invalidData = append(invalidData, CIDMappingMagic...)
+	sizeBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(sizeBuf, 16)
+	invalidData = append(invalidData, sizeBuf...)
+	invalidData = append(invalidData, make([]byte, EntrySize+1)...)
+
 	err := index.UnmarshalBinary(invalidData)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "not a multiple of EntrySize")
+	assert.Contains(t, err.Error(), "EntrySize")
 }
 
 func TestUnmarshalBinary_Empty(t *testing.T) {
 	var index IndexDataV2
 
-	// Test with empty data
+	// Combined layout is required; empty data must fail
 	emptyData := make([]byte, 0)
 	err := index.UnmarshalBinary(emptyData)
-	require.NoError(t, err)
-	assert.Equal(t, 0, index.NumPieces())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too short")
 }
 
 func TestIndexSize(t *testing.T) {
@@ -281,13 +289,12 @@ func TestIndexSerializationRoundTrip(t *testing.T) {
 	data, err := index.MarshalBinary()
 	require.NoError(t, err)
 
-	// Unmarshal
 	var decoded IndexDataV2
 	err = decoded.UnmarshalBinary(data)
 	require.NoError(t, err)
 
-	// Verify all entries match
-	assert.Equal(t, index.NumPieces(), decoded.NumPieces())
+	// Decoded has original entries + 1 special CID mapping descriptor
+	assert.Equal(t, index.NumPieces()+1, decoded.NumPieces())
 
 	for i := 0; i < index.NumPieces(); i++ {
 		original := index.Entry(i)
@@ -337,29 +344,23 @@ func TestMarshalBinary_WithNilEntries(t *testing.T) {
 	comm1 := fr32.Fr32{1}
 	entry1 := makeTestEntry(t, &comm1, 0, 1024)
 
-	// Create index with nil entries
-	index := &IndexDataV2{
-		Entries: []*SegmentDesc{entry1, nil, nil},
-	}
+	index := &IndexDataV2{Entries: []*SegmentDesc{entry1, nil, nil}}
 
 	data, err := index.MarshalBinary()
 	require.NoError(t, err)
 
-	// Should still marshal successfully, nil entries are handled
-	assert.Equal(t, 3*EntrySize, len(data))
+	// Layout: mapping (min 16) + index (3 blob + 1 special = 4 entries)
+	assert.GreaterOrEqual(t, len(data), len(CIDMappingMagic)+8+4*EntrySize)
 }
 
 func TestUnmarshalBinary_MultipleEntries(t *testing.T) {
-	// Create index with many entries
 	entries := make([]*SegmentDesc, 10)
 	for i := 0; i < 10; i++ {
 		comm := fr32.Fr32{byte(i), byte(i + 1), byte(i + 2)}
 		entries[i] = makeTestEntry(t, &comm, uint64(i*1024), 1024)
 	}
-
 	index := makeTestIndex(t, entries)
 
-	// Marshal and unmarshal
 	data, err := index.MarshalBinary()
 	require.NoError(t, err)
 
@@ -367,19 +368,42 @@ func TestUnmarshalBinary_MultipleEntries(t *testing.T) {
 	err = decoded.UnmarshalBinary(data)
 	require.NoError(t, err)
 
-	assert.Equal(t, 10, decoded.NumPieces())
+	// 10 blob entries + 1 special CID mapping descriptor
+	assert.Equal(t, 11, decoded.NumPieces())
 
-	// Verify all entries
 	for i := 0; i < 10; i++ {
 		original := index.Entry(i)
 		decodedEntry := decoded.Entry(i)
-
 		require.NotNil(t, original)
 		require.NotNil(t, decodedEntry)
-
 		assert.Equal(t, original.CommDs, decodedEntry.CommDs)
 		assert.Equal(t, original.Offset, decodedEntry.Offset)
 	}
+}
+
+func TestUnmarshalBinary_RestoresCidMappings(t *testing.T) {
+	comm1 := fr32.Fr32{1}
+	comm2 := fr32.Fr32{2}
+	entry1 := makeTestEntry(t, &comm1, 0, 1024)
+	entry2 := makeTestEntry(t, &comm2, 1024, 512)
+	cid1, err := commcid.PieceCommitmentV1ToCID(entry1.CommDs[:])
+	require.NoError(t, err)
+
+	index := &IndexDataV2{
+		Entries:     []*SegmentDesc{entry1, entry2},
+		CidMappings: []*cid.Cid{&cid1, nil}, // segment 0 has CID, segment 1 none
+	}
+	data, err := index.MarshalBinary()
+	require.NoError(t, err)
+
+	var decoded IndexDataV2
+	err = decoded.UnmarshalBinary(data)
+	require.NoError(t, err)
+
+	require.Len(t, decoded.CidMappings, 2)
+	require.NotNil(t, decoded.CidMappings[0])
+	assert.True(t, decoded.CidMappings[0].Equals(cid1))
+	assert.Nil(t, decoded.CidMappings[1])
 }
 
 func TestIndexDataV2_ImplementsPieceIndex(t *testing.T) {

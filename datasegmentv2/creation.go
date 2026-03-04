@@ -29,34 +29,32 @@ type AggregateV2 struct {
 //   - dealSize: The target size of the aggregate deal
 //   - pieces: List of pieces with their data readers, offsets, and sizes
 func NewAggregate(dealSize abi.PaddedPieceSize, pieces []PieceData) (*AggregateV2, error) {
-	//if err := dealSize.Validate(); err != nil {
-	//	return nil, xerrors.Errorf("invalid dealSize: %w", err)
-	//}
-	//maxEntries := MaxIndexEntriesInDeal(dealSize)
-	//if uint(len(pieces)) > maxEntries {
-	//	return nil, xerrors.Errorf("too many pieces for a %d sized deal: %d > %d",
-	//		dealSize, len(pieces), maxEntries)
-	//}
-	//
-	//// Validate pieces and calculate total size
-	//var piecesTotalSize uint64
-	//for i, piece := range pieces {
-	//	if piece.RawSize == 0 {
-	//		return nil, xerrors.Errorf("piece %d: RawSize cannot be zero", i)
-	//	}
-	//	if piece.BeginAt < piecesTotalSize {
-	//		return nil, xerrors.Errorf("piece %d: overlap with previous data", i)
-	//	}
-	//	piecesTotalSize = piece.BeginAt + piece.RawSize
-	//}
-	//
-	//// Check if pieces and index fit in the deal
-	//indexSize := uint64(maxEntries) * EntrySize
-	//if piecesTotalSize+indexSize > uint64(dealSize) {
-	//	return nil, xerrors.Errorf(
-	//		"pieces are too large to fit in the deal: %d (pieces) + %d (index) > %d (dealSize)",
-	//		piecesTotalSize, indexSize, dealSize)
-	//}
+	maxEntries := MaxIndexEntriesInDeal(dealSize)
+	if uint(len(pieces)) > maxEntries {
+		return nil, xerrors.Errorf("too many pieces for a %d sized deal: %d > %d",
+			dealSize, len(pieces), maxEntries)
+	}
+
+	// Validate pieces and calculate total size
+	var piecesTotalSize uint64
+	for i, piece := range pieces {
+		if piece.RawSize == 0 {
+			return nil, xerrors.Errorf("piece %d: RawSize cannot be zero", i)
+		}
+		if piece.BeginAt < piecesTotalSize {
+			return nil, xerrors.Errorf("piece %d: overlap with previous data", i)
+		}
+		piecesTotalSize = piece.BeginAt + piece.RawSize
+	}
+
+	// Check if pieces and index fit in the deal
+	indexSize := uint64(maxEntries) * EntrySize
+	if piecesTotalSize+indexSize > uint64(dealSize) {
+		return nil, xerrors.Errorf(
+			"pieces are too large to fit in the deal: %d (pieces) + %d (index) > %d (dealSize)",
+			piecesTotalSize, indexSize, dealSize)
+	}
+
 	//
 	//// Calculate sector size (pre-Fr32-padding)
 	//// The sector size should accommodate all pieces plus the index

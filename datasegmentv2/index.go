@@ -3,17 +3,15 @@ package datasegmentv2
 import (
 	"bytes"
 	"encoding"
-	"io"
-	"runtime"
-	"sort"
-
+	"encoding/binary"
 	"github.com/filecoin-project/go-data-segment/fr32"
+	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
 	commcid "github.com/filecoin-project/go-fil-commcid"
-	"github.com/filecoin-project/go-fil-commp-hashhash/commp2"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
+	"io"
 )
 
 type validationError string
@@ -49,239 +47,53 @@ func MaxIndexEntriesInDeal(dealSize abi.PaddedPieceSize) uint {
 }
 
 type IndexDataV2 struct {
-	Entries []*SegmentDesc
+	Entries     []*SegmentDesc
+	CidMappings []*cid.Cid
+	Offset      int64
 }
 
 var _ PieceIndex = (*IndexDataV2)(nil)
 
-const readBlockSize = 4096
-
-// blobTask is sent from the assembler to workers: one blob's data to compute digest.
-type blobTask struct {
-	index  int   // original blob index (for ordering results)
-	offset int64 // sector offset of this blob
-	size   int64
-	data   []byte // copy of blob data
-}
-
-// blobResult is sent from workers back to the collector.
-type blobResult struct {
-	index   int
-	segment *SegmentDesc
-}
-
-// BuildFromSector builds the index from sector data using a reader goroutine, an assembler goroutine, and multiple worker goroutines.
-// One goroutine only reads the sector in 4KB blocks and sends them to a second goroutine, which assembles the stream,
-// extracts blob data by offsets/sizes, and sends computation tasks to workers that run commp2 digest; results are collected and ordered.
-func (id *IndexDataV2) BuildFromSector(sector io.ReaderAt, blobOffsets []int64, blobSizes []int64) error {
-	if len(blobSizes) != len(blobOffsets) {
-		return xerrors.Errorf("invalid blobs. offsets and sizes should be of the same length")
-	}
-	blobCnt := len(blobOffsets)
-	if blobCnt == 0 {
-		return xerrors.Errorf("empty blobs")
-	}
-
-	// Sort blob indices by offset so the assembler can emit in read order and compact the buffer.
-	type blobInfo struct {
-		index        int
-		offset, size int64
-	}
-	blobs := make([]blobInfo, blobCnt)
-	for i := range blobOffsets {
-		blobs[i] = blobInfo{index: i, offset: blobOffsets[i], size: blobSizes[i]}
-	}
-	sort.Slice(blobs, func(i, j int) bool { return blobs[i].offset < blobs[j].offset })
-
-	sectorEnd := int64(0)
-	for _, b := range blobs {
-		if end := b.offset + b.size; end > sectorEnd {
-			sectorEnd = end
-		}
-	}
-
-	numWorkers := min(runtime.NumCPU(), blobCnt)
-
-	taskCh := make(chan blobTask, numWorkers*2)
-	resultCh := make(chan blobResult, numWorkers*2)
-	// blockCh carries 4KB (or smaller) chunks from reader to assembler; sender closes when done.
-	blockCh := make(chan []byte, 32)
-
-	// Worker goroutines: consume tasks, compute digest, send results.
-	for w := 0; w < numWorkers; w++ {
-		go func() {
-			for t := range taskCh {
-				cal := commp2.Calc{}
-				if err := cal.BeginAt(uint64(t.offset)); err != nil {
-					resultCh <- blobResult{index: t.index, segment: nil}
-					continue
-				}
-				cal.Write(t.data)
-				commP, _, _ := cal.Digest()
-				resultCh <- blobResult{
-					index:   t.index,
-					segment: NewDataSegmentIndexEntry((*fr32.Fr32)(commP), uint64(t.offset), uint64(t.size)).WithUpdatedChecksum(),
-				}
-			}
-		}()
-	}
-
-	// Goroutine 1: only read sector in 4KB blocks and send to blockCh.
-	go func() {
-		for readPos := int64(0); readPos < sectorEnd; {
-			toRead := readBlockSize
-			if sectorEnd-readPos < int64(toRead) {
-				toRead = int(sectorEnd - readPos)
-			}
-			readBlock := make([]byte, toRead)
-			nr, err := sector.ReadAt(readBlock, readPos)
-			if err != nil || nr == 0 {
-				break
-			}
-			blockCh <- readBlock
-			readPos += int64(nr)
-		}
-		close(blockCh)
-	}()
-
-	// Goroutine 2: receive blocks in order, assemble buffer, parse out blobs and send tasks to taskCh.
-	go func() {
-		defer close(taskCh)
-		var buffer []byte
-		var bufferBase int64
-		readPos := int64(0)
-		nextBlob := 0
-
-		for chunk := range blockCh {
-			buffer = append(buffer, chunk...)
-			readPos += int64(len(chunk))
-
-			// Discard prefix we no longer need: keep only [nextBlobStart, readPos] to bound memory.
-			if nextBlob < blobCnt {
-				wantBase := blobs[nextBlob].offset
-				if wantBase > bufferBase {
-					drop := wantBase - bufferBase
-					if drop <= int64(len(buffer)) {
-						buffer = buffer[drop:]
-						bufferBase = wantBase
-					}
-				}
-			}
-
-			// Emit all blobs that are now fully in buffer.
-			for nextBlob < blobCnt {
-				b := blobs[nextBlob]
-				blobEnd := b.offset + b.size
-				if readPos < blobEnd {
-					break
-				}
-				startInBuf := b.offset - bufferBase
-				endInBuf := blobEnd - bufferBase
-				if startInBuf < 0 || endInBuf > int64(len(buffer)) {
-					break
-				}
-				data := make([]byte, b.size)
-				copy(data, buffer[startInBuf:endInBuf])
-				taskCh <- blobTask{index: b.index, offset: b.offset, size: b.size, data: data}
-				nextBlob++
-
-				oldBase := bufferBase
-				if nextBlob < blobCnt {
-					bufferBase = blobs[nextBlob].offset
-				} else {
-					bufferBase = readPos
-				}
-				drop := bufferBase - oldBase
-				if drop > 0 && drop <= int64(len(buffer)) {
-					buffer = buffer[drop:]
-				}
-			}
-		}
-	}()
-
-	// Collect results: we receive blobCnt results (one per blob), order by index.
-	segments := make([]*SegmentDesc, blobCnt)
-	received := 0
-	for received < blobCnt {
-		r := <-resultCh
-		if r.index >= 0 && r.index < blobCnt {
-			segments[r.index] = r.segment
-			received++
-		}
-	}
-
-	// Verify we have all segments (workers send nil on BeginAt error).
-	for i := range segments {
-		if segments[i] == nil {
-			return xerrors.Errorf("failed to build segment for blob %d (offset %d size %d)", i, blobOffsets[i], blobSizes[i])
-		}
-	}
-	id.Entries = segments
-	return nil
-}
-
-// ParseIndexSection reads the index section from the tail of the sector backwards.
-// It reads 4KB chunks and within each chunk parses EntrySize-sized segment entries from the end
-// backwards, validating each with checksum; when a checksum mismatch is found, the index section
-// is considered ended and parsing stops.
-// reader must allow reading the last size bytes (e.g. a SectionReader over the index region).
+// ParseIndexSection reads the index section and CID mapping section from the sector.
+// It reads the last entry (must be the MulticodecCIDMappingSection descriptor), uses its Offset and Size
+// to read the full [mapping section][index section] block, then calls UnmarshalBinary.
+// reader must allow reading from the sector; size is the sector length.
 func (id *IndexDataV2) ParseIndexSection(reader io.ReaderAt, size int64) error {
 	if size < int64(EntrySize) {
 		return xerrors.Errorf("invalid index section: size %d < EntrySize %d", size, EntrySize)
 	}
 
-	const blockSize = 4096 // read 4KB at a time and scan backwards for entries
-	entries := make([]*SegmentDesc, 0)
-	buf := make([]byte, blockSize)
-	// Read from the tail in 4KB chunks
-	readEnd := size
-	done := false
-
-	for readEnd > 0 && !done {
-		toRead := int64(blockSize)
-		if readEnd < toRead {
-			toRead = readEnd
-		}
-		// Align down to full entries so we never parse partial 128-byte blocks
-		toRead = (toRead / int64(EntrySize)) * int64(EntrySize)
-		if toRead == 0 {
-			break
-		}
-
-		readStart := readEnd - toRead
-		n, err := reader.ReadAt(buf[:toRead], readStart)
-		if err != nil && err != io.EOF {
-			return xerrors.Errorf("reading at offset %d: %w", readStart, err)
-		}
-		if n != int(toRead) {
-			break
-		}
-
-		// Within this chunk, process 128-byte entries from the end backwards
-		for i := int(toRead) - EntrySize; i >= 0; i -= EntrySize {
-			var entry SegmentDesc
-			if err := entry.UnmarshalBinary(buf[i : i+EntrySize]); err != nil {
-				done = true
-				break
-			}
-			if err := entry.Validate(); err != nil {
-				// Checksum mismatch or other validation failure: index section has ended
-				done = true
-				break
-			}
-			entries = append(entries, &entry)
-		}
-
-		readEnd = readStart
+	lastEntryBuf := make([]byte, EntrySize)
+	lastEntryOff := size - int64(EntrySize)
+	n, err := reader.ReadAt(lastEntryBuf, lastEntryOff)
+	if err != nil && err != io.EOF {
+		return xerrors.Errorf("reading last entry at offset %d: %w", lastEntryOff, err)
 	}
-
-	// We collected from tail to head; reverse so entries are in logical order (first segment first)
-	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
-		entries[i], entries[j] = entries[j], entries[i]
+	if n < EntrySize {
+		return xerrors.Errorf("short read for last entry: got %d", n)
 	}
-
-	id.Entries = entries
-	return nil
+	var lastEntry SegmentDesc
+	if err := lastEntry.UnmarshalBinary(lastEntryBuf); err != nil {
+		return xerrors.Errorf("unmarshal last entry: %w", err)
+	}
+	if lastEntry.Multicodec != uint64(MulticodecCIDMappingSection) {
+		return xerrors.Errorf("last entry is not CID mapping descriptor (multicodec=%d)", lastEntry.Multicodec)
+	}
+	mappingOff := int64(lastEntry.Offset)
+	mappingSize := int64(lastEntry.Size)
+	if mappingOff < 0 || mappingSize < 0 || mappingOff+mappingSize > size {
+		return xerrors.Errorf("invalid CID mapping descriptor: offset=%d size=%d sectorSize=%d", mappingOff, mappingSize, size)
+	}
+	blockLen := size - mappingOff
+	block := make([]byte, blockLen)
+	n, err = reader.ReadAt(block, mappingOff)
+	if err != nil && err != io.EOF {
+		return xerrors.Errorf("reading mapping+index block at offset %d: %w", mappingOff, err)
+	}
+	if int64(n) < blockLen {
+		return xerrors.Errorf("short read for mapping+index block: got %d want %d", n, blockLen)
+	}
+	return id.UnmarshalBinary(block)
 }
 
 // NumPieces returns the number of entries in the index
@@ -346,35 +158,168 @@ func (i *IndexDataV2) IndexSize() uint64 {
 	return uint64(i.NumPieces()) * uint64(EntrySize)
 }
 
-var _ encoding.BinaryMarshaler = &IndexDataV2{}
-var _ encoding.BinaryUnmarshaler = (*IndexDataV2)(nil)
+// CIDMappingMagic is the 8-byte magic for the CID mapping section (layout matches exa-gateway sector.go).
+const CIDMappingMagic = "CIDMAP01"
 
-func (id *IndexDataV2) MarshalBinary() (data []byte, err error) {
-	res := make([]byte, EntrySize*len(id.Entries))
-	for i, r := range id.Entries {
-		if r != nil {
-			r.SerializeFr32Into(res[i*EntrySize : (i+1)*EntrySize])
-		}
+// buildCIDMappingSection builds the CID mapping section bytes from CidMappings.
+// Layout: [magic 8 bytes] [section_total_size uint64] [entry1][entry2]...
+// Each entry: [entry_size uint32] [segment_index as uint64 LE, 8 zero bytes] [cid_len uint16] [cid_bytes]
+// section_total_size includes magic + size field + all entries.
+// The mapping section is always written: at minimum magic + size (16 bytes) even when there are zero mappings.
+func (id *IndexDataV2) buildCIDMappingSection() []byte {
+	const sizeField = 8
+	headerSize := len(CIDMappingMagic) + sizeField // 16
+	var entries []byte
+	n := len(id.Entries)
+	if n > len(id.CidMappings) {
+		n = len(id.CidMappings)
 	}
-	return res, nil
+	for i := 0; i < n; i++ {
+		c := id.CidMappings[i]
+		if c == nil || !c.Defined() {
+			continue
+		}
+		cidBytes := c.Bytes()
+		// entry_size (4) + piece_id placeholder 16 (segment index 8 + 8 zero) + cid_len (2) + cid_bytes
+		entrySize := 4 + 16 + 2 + len(cidBytes)
+		entry := make([]byte, entrySize)
+		binary.LittleEndian.PutUint32(entry[0:4], uint32(entrySize))
+		binary.LittleEndian.PutUint64(entry[4:12], uint64(i))
+		// 12:16 zero
+		binary.LittleEndian.PutUint16(entry[20:22], uint16(len(cidBytes)))
+		copy(entry[22:], cidBytes)
+		entries = append(entries, entry...)
+	}
+	totalSize := headerSize + len(entries)
+	if totalSize < headerSize {
+		totalSize = headerSize
+	}
+	out := make([]byte, 0, totalSize)
+	out = append(out, CIDMappingMagic...)
+	buf8 := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf8, uint64(totalSize))
+	out = append(out, buf8...)
+	out = append(out, entries...)
+	return out
 }
 
+// MarshalBinary produces the combined layout: [CID mapping section][index section].
+// The mapping section is always written (at least magic + size; see buildCIDMappingSection).
+// It builds the mapping section, inserts a special SegmentDesc (MulticodecCIDMappingSection) into the index entries with Offset = id.Offset and Size = mapping section length,
+// then serializes the index section. The returned binary is intended to be written at sector offset id.Offset (mapping then index follow).
+func (id *IndexDataV2) MarshalBinary() (data []byte, err error) {
+	mappingSection := id.buildCIDMappingSection() // always at least magic+size (16 bytes)
+	mappingSize := uint64(len(mappingSection))
+	mappingOffset := uint64(id.Offset)
+
+	// Build index entries: original Entries + special entry for CID mapping section
+	entriesCnt := len(id.Entries)
+	indexSection := make([]byte, EntrySize*(entriesCnt+1))
+	for i, r := range id.Entries {
+		if r != nil {
+			r.SerializeFr32Into(indexSection[i*EntrySize : (i+1)*EntrySize])
+		}
+	}
+
+	var zeroComm merkletree.Node
+	NewDataSegmentIndexEntry((*fr32.Fr32)(&zeroComm), mappingOffset, mappingSize).
+		WithCodec(MulticodecCIDMappingSection, merkletree.Node{}).
+		WithUpdatedChecksum().
+		SerializeFr32Into(indexSection[entriesCnt*EntrySize : (entriesCnt+1)*EntrySize])
+
+	return append(mappingSection, indexSection...), nil
+}
+
+// parseCIDMappingSection parses the CID mapping section body (after magic+size) and returns (segmentIndex, cid) pairs.
+// Entry format: [entry_size uint32][segment_index uint64][8 zero][cid_len uint16][cid_bytes]
+func parseCIDMappingSection(body []byte) ([]struct {
+	segmentIndex uint64
+	cid          cid.Cid
+}, error) {
+	const minEntrySize = 4 + 16 + 2 // entry_size + segment_id placeholder + cid_len
+	var out []struct {
+		segmentIndex uint64
+		cid          cid.Cid
+	}
+	pos := 0
+	for pos+4 <= len(body) {
+		entrySize := binary.LittleEndian.Uint32(body[pos:])
+		pos += 4
+		payloadLen := int(entrySize) - 4
+		if payloadLen < minEntrySize-4 || pos+payloadLen > len(body) {
+			break
+		}
+		segmentIndex := binary.LittleEndian.Uint64(body[pos:])
+		cidLen := binary.LittleEndian.Uint16(body[pos+16:])
+		cidEnd := pos + 18 + int(cidLen)
+		if cidEnd > pos+payloadLen {
+			break
+		}
+		c, err := cid.Cast(body[pos+18 : cidEnd])
+		if err != nil {
+			break
+		}
+		out = append(out, struct {
+			segmentIndex uint64
+			cid          cid.Cid
+		}{segmentIndex, c})
+		pos += payloadLen
+	}
+	return out, nil
+}
+
+// UnmarshalBinary expects the combined layout from MarshalBinary: [CID mapping section][index section].
+// The mapping section must be present (data must start with CIDMappingMagic). It is always parsed; then the index section is parsed into Entries.
+// Index-only data is not supported; if the magic is missing, UnmarshalBinary returns an error.
 func (id *IndexDataV2) UnmarshalBinary(data []byte) error {
-	if rem := len(data) % EntrySize; rem != 0 {
-		return xerrors.Errorf("data to unmarshal is not a multiple of EntrySize: %d % %d != 0 (%d)",
-			len(data), EntrySize, rem)
+	if len(data) < len(CIDMappingMagic)+8 {
+		return xerrors.Errorf("data too short for CID mapping section (need at least magic+size)")
+	}
+	if string(data[:len(CIDMappingMagic)]) != CIDMappingMagic {
+		return xerrors.Errorf("data does not start with CID mapping magic; combined [mapping][index] layout required")
+	}
+	mappingSectionSize := binary.LittleEndian.Uint64(data[len(CIDMappingMagic) : len(CIDMappingMagic)+8])
+	const headerSize = len(CIDMappingMagic) + 8
+	if mappingSectionSize < uint64(headerSize) || int(mappingSectionSize) > len(data) {
+		return xerrors.Errorf("invalid CID mapping section size %d", mappingSectionSize)
+	}
+	body := data[headerSize:mappingSectionSize]
+	mappingPairs, err := parseCIDMappingSection(body)
+	if err != nil {
+		return xerrors.Errorf("parse CID mapping section: %w", err)
+	}
+	indexData := data[mappingSectionSize:]
+	if rem := len(indexData) % EntrySize; rem != 0 {
+		return xerrors.Errorf("index data is not a multiple of EntrySize: %d %% %d != 0 (%d)",
+			len(indexData), EntrySize, rem)
 	}
 
 	*id = IndexDataV2{}
-	numEntries := len(data) / EntrySize
+	numEntries := len(indexData) / EntrySize
 	id.Entries = make([]*SegmentDesc, numEntries)
 	for i := 0; i < numEntries; i++ {
 		var entry SegmentDesc
-		err := entry.UnmarshalBinary(data[i*EntrySize : (i+1)*EntrySize])
+		err := entry.UnmarshalBinary(indexData[i*EntrySize : (i+1)*EntrySize])
 		if err != nil {
-			return xerrors.Errorf("unamrshaling entry at index %d: %w", i, err)
+			return xerrors.Errorf("unmarshaling entry at index %d: %w", i, err)
+		}
+		if err := entry.Validate(); err != nil {
+			return xerrors.Errorf("entry at index %v is invalid: %v", i, err)
 		}
 		id.Entries[i] = &entry
+	}
+	// Restore CidMappings: length = blob count (last entry is special CID mapping descriptor)
+	blobCount := numEntries
+	if numEntries > 0 && id.Entries[numEntries-1] != nil && id.Entries[numEntries-1].Multicodec == MulticodecCIDMappingSection {
+		blobCount = numEntries - 1
+	}
+	id.CidMappings = make([]*cid.Cid, blobCount)
+	for _, p := range mappingPairs {
+		if p.segmentIndex >= uint64(blobCount) {
+			continue
+		}
+		cCopy := p.cid
+		id.CidMappings[p.segmentIndex] = &cCopy
 	}
 	return nil
 }
