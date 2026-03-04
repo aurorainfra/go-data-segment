@@ -10,9 +10,12 @@ import (
 	commcid "github.com/filecoin-project/go-fil-commcid"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
+	logging "github.com/ipfs/go-log/v2"
 	"golang.org/x/xerrors"
 	"io"
 )
+
+var indexLog = logging.Logger("datasegment/index")
 
 type validationError string
 
@@ -59,6 +62,7 @@ var _ PieceIndex = (*IndexDataV2)(nil)
 // to read the full [mapping section][index section] block, then calls UnmarshalBinary.
 // reader must allow reading from the sector; size is the sector length.
 func (id *IndexDataV2) ParseIndexSection(reader io.ReaderAt, size int64) error {
+	indexLog.Infof("start to parse index section. size: %v", size)
 	if size < int64(EntrySize) {
 		return xerrors.Errorf("invalid index section: size %d < EntrySize %d", size, EntrySize)
 	}
@@ -81,10 +85,12 @@ func (id *IndexDataV2) ParseIndexSection(reader io.ReaderAt, size int64) error {
 	}
 	mappingOff := int64(lastEntry.Offset)
 	mappingSize := int64(lastEntry.Size)
+	indexLog.Infof("mapping section: offset=%v, size=%v", mappingOff, mappingSize)
 	if mappingOff < 0 || mappingSize < 0 || mappingOff+mappingSize > size {
 		return xerrors.Errorf("invalid CID mapping descriptor: offset=%d size=%d sectorSize=%d", mappingOff, mappingSize, size)
 	}
 	blockLen := size - mappingOff
+	indexLog.Infof("blockLen: %v", blockLen)
 	block := make([]byte, blockLen)
 	n, err = reader.ReadAt(block, mappingOff)
 	if err != nil && err != io.EOF {
@@ -279,12 +285,14 @@ func (id *IndexDataV2) UnmarshalBinary(data []byte) error {
 		return xerrors.Errorf("data does not start with CID mapping magic; combined [mapping][index] layout required")
 	}
 	mappingSectionSize := binary.LittleEndian.Uint64(data[len(CIDMappingMagic) : len(CIDMappingMagic)+8])
+	indexLog.Infof("Unmarshaling index data. mapping section size: %v", mappingSectionSize)
 	const headerSize = len(CIDMappingMagic) + 8
 	if mappingSectionSize < uint64(headerSize) || int(mappingSectionSize) > len(data) {
 		return xerrors.Errorf("invalid CID mapping section size %d", mappingSectionSize)
 	}
 	body := data[headerSize:mappingSectionSize]
 	mappingPairs, err := parseCIDMappingSection(body)
+	indexLog.Infof("unmarshaling index data. mappingPairs count: %v", len(mappingPairs))
 	if err != nil {
 		return xerrors.Errorf("parse CID mapping section: %w", err)
 	}
@@ -296,6 +304,7 @@ func (id *IndexDataV2) UnmarshalBinary(data []byte) error {
 
 	*id = IndexDataV2{}
 	numEntries := len(indexData) / EntrySize
+	indexLog.Infof("unmarshaling index data. index section size: %v, entries: %v", len(indexData), numEntries)
 	id.Entries = make([]*SegmentDesc, numEntries)
 	for i := 0; i < numEntries; i++ {
 		var entry SegmentDesc
