@@ -152,11 +152,10 @@ func TestComputeExpectedAuxData_SinglePiece(t *testing.T) {
 	proof, err := CollectInclusionProof(agg.Tree, agg.DealSize, 0)
 	require.NoError(t, err)
 
-	// Get piece CommP from index entry
+	// Get piece CommP from index entry (stored as CommData when built from CommP)
 	entry := agg.Index.Entry(0)
 	require.NotNil(t, entry)
-	commDs := entry.CommDs
-	commPc, err := commcid.PieceCommitmentV1ToCID(commDs[:])
+	commPc, err := commcid.PieceCommitmentV1ToCID(entry.CommData[:])
 	require.NoError(t, err)
 
 	// Create verifier data
@@ -197,8 +196,7 @@ func TestComputeExpectedAuxData_ZeroSize(t *testing.T) {
 	require.NoError(t, err)
 	entry := agg.Index.Entry(0)
 	require.NotNil(t, entry)
-	commDs := entry.CommDs
-	commPc, err := commcid.PieceCommitmentV1ToCID(commDs[:])
+	commPc, err := commcid.PieceCommitmentV1ToCID(entry.CommData[:])
 	require.NoError(t, err)
 	// Test with zero size
 	verifierData := InclusionVerifierData{
@@ -313,12 +311,11 @@ func TestInclusionProof_MultiplePieces_Verification(t *testing.T) {
 			assert.GreaterOrEqual(t, len(proof.RightProofSubtree.Path), 0, "piece %d: right proof path is empty", i)
 			assert.GreaterOrEqual(t, len(proof.ProofIndex.Path), 0, "piece %d: index proof path is empty", i)
 
-			// Get piece CommP from index entry
+			// Get piece CommP from index entry (stored as CommData when built from CommP)
 			entry := agg.Index.Entry(i)
 			require.NotNil(t, entry, "piece %d: index entry is nil", i)
-			commDs := entry.CommDs
-			commPc, err := commcid.PieceCommitmentV1ToCID(commDs[:])
-			require.NoError(t, err, "piece %d: failed to convert CommDs to CID", i)
+			commPc, err := commcid.PieceCommitmentV1ToCID(entry.CommData[:])
+			require.NoError(t, err, "piece %d: failed to convert CommData to CID", i)
 			require.False(t, commPc.Equals(cid.Undef), "piece %d: piece CID is undefined", i)
 
 			// Create verifier data
@@ -361,7 +358,7 @@ func TestInclusionProof_MultiplePieces_Verification(t *testing.T) {
 	for i := 0; i < len(pieces); i++ {
 		entry := agg.Index.Entry(i)
 		require.NotNil(t, entry)
-		commP, err := commcid.PieceCommitmentV1ToCID(entry.CommDs[:])
+		commP, err := commcid.PieceCommitmentV1ToCID(entry.CommData[:])
 		require.NoError(t, err)
 		commPs[i] = commP
 	}

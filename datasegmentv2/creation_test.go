@@ -6,7 +6,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/filecoin-project/go-data-segment/fr32"
 	commcid "github.com/filecoin-project/go-fil-commcid"
 	commp2 "github.com/filecoin-project/go-fil-commp-hashhash/commp2"
 	"github.com/filecoin-project/go-state-types/abi"
@@ -489,10 +488,10 @@ func TestAggregateV2_PieceCommP_Consistency_OffsetZero(t *testing.T) {
 	require.NotNil(t, commp2Digest)
 	require.Equal(t, 32, len(commp2Digest))
 
-	// Get CommP from index entry
+	// Get CommP from index entry (stored as CommData when built from CommP)
 	entry := agg.Index.Entry(0)
 	require.NotNil(t, entry)
-	indexCommP := entry.CommDs
+	indexCommP := entry.CommData
 
 	// Compare CommP values
 	commp2CommPArray := [32]byte{}
@@ -566,10 +565,10 @@ func TestAggregateV2_PieceCommP_Consistency(t *testing.T) {
 		require.Equal(t, 32, len(commp2Digest), "piece %d: commp2 digest should be 32 bytes", i)
 		require.Greater(t, paddedSize, uint64(0), "piece %d: padded size should be > 0", i)
 
-		// Get CommP from index entry (which was extracted from the sector tree)
+		// Get CommP from index entry (stored as CommData when built from CommP)
 		entry := agg.Index.Entry(i)
 		require.NotNil(t, entry, "piece %d: index entry is nil", i)
-		indexCommP := entry.CommDs
+		indexCommP := entry.CommData
 
 		// Compare CommP values
 		// commp2Digest is a slice, indexCommP is [32]byte (merkletree.Node)
@@ -585,19 +584,16 @@ func TestAggregateV2_PieceCommP_Consistency(t *testing.T) {
 				"  BeginAt: %d, RawSize: %d",
 			i, indexCommP[:], commp2CommPArray[:], piece.BeginAt, piece.RawSize)
 
-		// Also verify as CIDs for better error messages
-		indexCID := entry.PieceCID()
-		require.False(t, indexCID.Equals(cid.Undef), "piece %d: index CID is undefined", i)
-
+		// Verify piece commitment CID from index CommData matches commp2
 		commp2CID, err := commcid.PieceCommitmentV1ToCID(commp2Digest)
 		require.NoError(t, err, "piece %d: failed to convert commp2 digest to CID", i)
-
-		// CID comparison - should match since CommP matches
-		assert.True(t, indexCID.Equals(commp2CID),
-			"piece %d: PieceCID mismatch\n"+
+		indexPieceCID, err := commcid.PieceCommitmentV1ToCID(indexCommP[:])
+		require.NoError(t, err, "piece %d: failed to convert index CommData to CID", i)
+		assert.True(t, indexPieceCID.Equals(commp2CID),
+			"piece %d: piece CID from index CommData should match commp2\n"+
 				"  Index CID:  %s\n"+
 				"  commp2 CID: %s",
-			i, indexCID.String(), commp2CID.String())
+			i, indexPieceCID.String(), commp2CID.String())
 	}
 }
 
@@ -649,10 +645,10 @@ func TestAggregateV2_PieceCommP_Consistency_Misaligned(t *testing.T) {
 		require.Equal(t, 32, len(commp2Digest), "piece %d: commp2 digest should be 32 bytes", i)
 		require.Greater(t, paddedSize, uint64(0), "piece %d: padded size should be > 0", i)
 
-		// Get CommP from index entry
+		// Get CommP from index entry (stored as CommData when built from CommP)
 		entry := agg.Index.Entry(i)
 		require.NotNil(t, entry, "piece %d: index entry is nil", i)
-		indexCommP := entry.CommDs
+		indexCommP := entry.CommData
 
 		// Compare CommP values
 		commp2CommPArray := [32]byte{}
@@ -668,44 +664,25 @@ func TestAggregateV2_PieceCommP_Consistency_Misaligned(t *testing.T) {
 	}
 }
 
-// TestSegmentDesc_PieceCIDV2 tests PieceCIDV2() which uses DataCommitmentToPieceCidv2(CommDs, RawSize).
+// TestSegmentDesc_PieceCIDV2 asserts PieceCIDV2 is not supported in CID-based index format.
 func TestSegmentDesc_PieceCIDV2(t *testing.T) {
-	// Valid entry: 32-byte CommDs, RawSize >= 127
-	t.Run("Valid", func(t *testing.T) {
-		var commD [32]byte
-		for i := range commD {
-			commD[i] = byte(i)
-		}
-		entry := NewDataSegmentIndexEntry((*fr32.Fr32)(&commD), 0, 1024)
+	// In CID-based index format, PieceCIDV2 is not supported (no CommP stored).
+	t.Run("Unsupported", func(t *testing.T) {
+		entry := NewDataSegmentIndexEntryFromMultihash(MultihashBlake3, []byte{1, 2, 3, 4, 5}, 0, 1024)
 		require.NotNil(t, entry)
 		pieceCID, err := entry.PieceCIDV2()
-		require.NoError(t, err)
-		assert.False(t, pieceCID.Equals(cid.Undef))
-		// Must match direct call to DataCommitmentToPieceCidv2
-		expected, err := commcid.DataCommitmentToPieceCidv2(entry.CommDs[:], entry.RawSize)
-		require.NoError(t, err)
-		assert.True(t, pieceCID.Equals(expected), "PieceCIDV2() should equal DataCommitmentToPieceCidv2(CommDs, RawSize)")
-	})
-
-	t.Run("NonZeroOffset", func(t *testing.T) {
-		var commD [32]byte
-		commD[0] = 1
-		entry := NewDataSegmentIndexEntry((*fr32.Fr32)(&commD), 127, 512)
-		require.NotNil(t, entry)
-		pieceCID, err := entry.PieceCIDV2()
-		require.NoError(t, err)
-		assert.False(t, pieceCID.Equals(cid.Undef))
-		expected, err := commcid.DataCommitmentToPieceCidv2(entry.CommDs[:], entry.RawSize)
-		require.NoError(t, err)
-		assert.True(t, pieceCID.Equals(expected))
-	})
-
-	// RawSize < 127 is rejected by DataCommitmentToPieceCidv2
-	t.Run("RawSizeTooSmall", func(t *testing.T) {
-		var commD [32]byte
-		entry := NewDataSegmentIndexEntry((*fr32.Fr32)(&commD), 0, 100)
-		require.NotNil(t, entry)
-		_, err := entry.PieceCIDV2()
 		assert.Error(t, err)
+		assert.True(t, pieceCID.Equals(cid.Undef))
+		assert.Contains(t, err.Error(), "not supported")
+	})
+
+	// DataCID is supported for content lookup.
+	t.Run("DataCID", func(t *testing.T) {
+		digest := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+		entry := NewDataSegmentIndexEntryFromMultihash(MultihashBlake3, digest, 0, 256)
+		require.NotNil(t, entry)
+		dataCID, err := entry.DataCID()
+		require.NoError(t, err)
+		assert.False(t, dataCID.Equals(cid.Undef))
 	})
 }

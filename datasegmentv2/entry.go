@@ -5,15 +5,15 @@ import (
 	"encoding"
 	"encoding/binary"
 	"fmt"
+	"io"
+
 	"github.com/filecoin-project/go-data-segment/fr32"
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
-	commcid "github.com/filecoin-project/go-fil-commcid"
-	"golang.org/x/xerrors"
-
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	cbg "github.com/whyrusleeping/cbor-gen"
-	"io"
+	"golang.org/x/xerrors"
 )
 
 const ChecksumSize = 16
@@ -27,43 +27,61 @@ const EntrySize = NodesPerEntry * merkletree.NodeSize // 128 bytes (4 nodes of 3
 
 // Multicodec values
 const (
-	MulticodecRaw                = 0x55   // Raw binary data
-	MulticodecCAR                = 0x0202 // CAR format (IPLD)
-	MulticodecCIDMappingSection  = 0xee01 // Special entry: describes the CID mapping section (Offset + Size in this sector)
+	MulticodecRaw        = 0x55   // Raw binary data
+	MulticodecCAR        = 0x0202 // CAR format (IPLD)
+	MulticodeIndexFooter = 0xee01 // Special entry: describes the CID mapping section (Offset + Size in this sector)
 )
 
-// SegmentDesc contains a data segment description (v2 format)
-// to be contained as four Fr32 elements in 4 leaf nodes of the data segment index
-// All offset and size fields represent pre-Fr32-padding byte positions and lengths
+// Multihash codes (multicodec table)
+const (
+	MultihashBlake3 = 0x1e // BLAKE3-256, 32-byte digest
+)
+
+// SegmentDesc contains a data segment description (v2 format, CID-based).
+// Entry layout per FIPs #1216 alternate: Node1=CommData (254 bits), Node2=Multicodec|Multihash|Reserved|2 bits of CommData,
+// Node3=Reserved|Offset|Size|RawSize, Node4=ACL|Checksum. CommData is the multihash digest (e.g. 32-byte BLAKE3).
+// All offset and size fields represent pre-Fr32-padding byte positions and lengths.
 type SegmentDesc struct {
-	CommDs merkletree.Node
-	Offset uint64 // pre-Fr32-padding offset from start of deal
+	// node 1
+	CommData [32]byte // 256-bit multihash digest; 254 bits in Node1, last 2 bits in Node2
 
-	// Size is the total size including trailing padding (pre-Fr32-padding)
-	Size    uint64
-	RawSize uint64
+	// node 2
+	Multihash  uint64 // multihash code (e.g. 0x1e for blake3)
+	Multicodec uint64
+	// 124 bits reserved in node2
 
-	Multicodec          uint64
-	MulticodecDependent merkletree.Node
-	ACLType             uint8
-	ACLData             uint64
-	Reserved            [14]byte
-	Checksum            [ChecksumSize]byte
+	// node 3
+	Node3Reserved uint64 // 64 bits reserved in Node 3
+	Offset        uint64 // pre-Fr32-padding offset from start of deal
+	Size          uint64 // total size including trailing padding (pre-Fr32-padding)
+	RawSize       uint64 // actual data size before padding (62 bits in spec, stored as uint64)
+
+	// node 4
+	ACLType  uint8
+	ACLData  uint64
+	Reserved [14]byte
+	Checksum [ChecksumSize]byte
 }
 
-// PieceCID returns the PieceCID v1 of the sub-deal
+// DataCID returns the content CID this entry represents (from Multicodec + Multihash + CommData).
+// This is the client-known CID used for retrieval in the CID-based index format.
+func (sd SegmentDesc) DataCID() (cid.Cid, error) {
+	return cidFromMultihash(sd.Multicodec, sd.Multihash, sd.CommData[:])
+}
+
+// PieceCID returns the content CID (same as DataCID) for compatibility.
+// Panics if the entry cannot form a valid CID (e.g. zero Multihash for sentinel entries).
 func (sd SegmentDesc) PieceCID() cid.Cid {
-	c, err := commcid.PieceCommitmentV1ToCID(sd.CommDs[:])
+	c, err := sd.DataCID()
 	if err != nil {
-		panic("CommDs is always 32 bytes: " + err.Error())
+		panic("SegmentDesc.PieceCID: " + err.Error())
 	}
 	return c
 }
 
-// PieceCIDV2 computes the Piece CID v2 (FRC-0069) for this segment using the index entry's
-// CommDs and RawSize, via commcid.DataCommitmentToPieceCidv2.
+// PieceCIDV2 is not supported in the CID-based index format (no CommP stored).
 func (sd SegmentDesc) PieceCIDV2() (cid.Cid, error) {
-	return commcid.DataCommitmentToPieceCidv2(sd.CommDs[:], sd.RawSize)
+	return cid.Undef, xerrors.Errorf("PieceCIDV2 not supported in CID-based index format")
 }
 
 // UnpaddedOffset returns unpadded offset of the sub-deal relative to the deal start
@@ -108,11 +126,11 @@ func (sd SegmentDesc) CommAndLoc() merkletree.CommAndLoc {
 	height := sd.Height()
 	lvl := int(height)
 	leafIndex := sd.Offset / merkletree.NodeSize
-	// For a tree of height h, the root is at level h, and we need to compute the index
-	// at that level that contains this leaf
 	subtreeIndex := leafIndex >> height
+	var comm merkletree.Node
+	copy(comm[:], sd.CommData[:])
 	res := merkletree.CommAndLoc{
-		Comm: sd.CommDs,
+		Comm: comm,
 		Loc: merkletree.Location{
 			Level: lvl,
 			Index: subtreeIndex,
@@ -135,54 +153,85 @@ type SegmentDescV1 struct {
 }
 
 func NewDataSegmentDescFromV1(sd *SegmentDescV1) *SegmentDesc {
-	// For V1, Size is the total size (which in v2 terms would be both Size and RawSize)
-	// Since V1 doesn't have padding, we use Size as both Size and RawSize
-	return NewDataSegmentIndexEntry((*fr32.Fr32)(&sd.CommDs), sd.Offset, sd.Size).WithUpdatedChecksum()
+	// V1 used CommDs; store as CommData with multihash 0 (legacy)
+	return NewDataSegmentIndexEntryFromMultihash(0, sd.CommDs[:], sd.Offset, sd.Size).WithUpdatedChecksum()
 }
 
-// NewDataSegmentIndexEntry creates a new SegmentDesc entry for v2 format
-// Parameters:
-//   - CommP: The piece commitment (CommDs)
-//   - offset: Pre-Fr32-padding byte offset from start of deal (can be arbitrary, no alignment required)
-//   - rawSize: Pre-Fr32-padding actual data size (can be arbitrary, no power-of-two requirement)
-//
-// The function computes Size (total size including padding) such that:
-//   - Size >= RawSize
-//   - After Fr32 padding, Size is aligned to NodeSize boundaries
-//
-// For v2, both offset and size can be arbitrary - no power-of-two alignment is required.
-// The piece will be placed at the exact offset specified, and the size will be
-// the minimum needed to contain the rawSize data after Fr32 padding.
-func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, rawSize uint64) *SegmentDesc {
-	// Calculate the minimum post-Fr32 size needed to contain the rawSize data
-	// Fr32 padding: post-Fr32 = ceil(pre-Fr32 * 128 / 127)
-	// We need: post-Fr32 >= rawSize (to contain the data)
-	// And: post-Fr32 should be aligned to NodeSize boundaries
+// cidFromMultihash builds a CID from content codec, multihash code, and digest.
+func cidFromMultihash(codec uint64, mhCode uint64, digest []byte) (cid.Cid, error) {
+	if mhCode == 0 && len(digest) == 0 {
+		return cid.Undef, xerrors.Errorf("cannot build CID from zero multihash and empty digest")
+	}
+	mh, err := multihash.Encode(digest, mhCode)
+	if err != nil {
+		return cid.Undef, err
+	}
+	return cid.NewCidV1(codec, mh), nil
+}
 
-	// Start by computing minimum post-Fr32 size needed
+// computeSizeFromRawSize returns the minimum Size (pre-Fr32) that contains rawSize after Fr32 padding.
+func computeSizeFromRawSize(rawSize uint64) uint64 {
 	minPostFr32Size := rawSize
 	if minPostFr32Size%merkletree.NodeSize != 0 {
 		minPostFr32Size = ((minPostFr32Size / merkletree.NodeSize) + 1) * merkletree.NodeSize
 	}
-
-	// Convert back to pre-Fr32 size
-	// post-Fr32 = ceil(pre-Fr32 * 128 / 127)
-	// So: pre-Fr32 >= (post-Fr32 * 127 + 126) / 128
-	// We use the minimum pre-Fr32 size that gives us the required post-Fr32 size
 	size := (minPostFr32Size*127 + 126) / 128
-
-	// Ensure Size is at least RawSize (should always be true, but check anyway)
 	if size < rawSize {
 		size = rawSize
 	}
+	return size
+}
 
+// NewDataSegmentIndexEntryFromCID creates a SegmentDesc from a content CID (multicodec + multihash + digest).
+// Digest is copied into CommData (padded or truncated to 32 bytes). Max digest length 32 bytes.
+func NewDataSegmentIndexEntryFromCID(c cid.Cid, offset uint64, rawSize uint64) (*SegmentDesc, error) {
+	if !c.Defined() {
+		return nil, xerrors.Errorf("CID is undefined")
+	}
+	dec, err := multihash.Decode(c.Hash())
+	if err != nil {
+		return nil, xerrors.Errorf("decode CID multihash: %w", err)
+	}
+	digest := dec.Digest
+	if len(digest) > 32 {
+		return nil, xerrors.Errorf("CID digest longer than 32 bytes")
+	}
+	var commData [32]byte
+	copy(commData[:], digest)
+	pref := c.Prefix()
+	sd := NewDataSegmentIndexEntryFromMultihash(pref.MhType, commData[:], offset, rawSize)
+	sd.Multicodec = pref.Codec
+	return sd, nil
+}
+
+// NewDataSegmentIndexEntryFromMultihash creates a SegmentDesc from multihash code and digest.
+// If digest is nil or empty, CommData is zeroed (for sentinel entries like CID mapping section).
+func NewDataSegmentIndexEntryFromMultihash(multihashCode uint64, digest []byte, offset uint64, rawSize uint64) *SegmentDesc {
+	var commData [32]byte
+	if len(digest) > 0 {
+		copy(commData[:], digest)
+		if len(digest) < 32 {
+			// zero-pad rest
+		}
+	}
+	size := computeSizeFromRawSize(rawSize)
 	return &SegmentDesc{
-		CommDs:     *(*merkletree.Node)(CommP),
+		CommData:   commData,
+		Multihash:  multihashCode,
+		Multicodec: MulticodecRaw,
 		Offset:     offset,
 		Size:       size,
 		RawSize:    rawSize,
-		Multicodec: MulticodecRaw,
 	}
+}
+
+// NewDataSegmentIndexEntry creates a sentinel entry with the given offset and size (e.g. CID mapping section).
+// CommData and Multihash are zero. Deprecated for data segments; use FromCID or FromMultihash.
+func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, rawSize uint64) *SegmentDesc {
+	if CommP == nil {
+		return NewDataSegmentIndexEntryFromMultihash(0, nil, offset, rawSize)
+	}
+	return NewDataSegmentIndexEntryFromMultihash(0, (*CommP)[:], offset, rawSize)
 }
 
 func (sd *SegmentDesc) computeChecksum() [ChecksumSize]byte {
@@ -211,43 +260,46 @@ func (sd *SegmentDesc) MarshalBinary() ([]byte, error) {
 
 func (sd *SegmentDesc) UnmarshalBinary(data []byte) error {
 	if len(data) != EntrySize {
-
 		return xerrors.Errorf("invalid segment description size: expected %d, got %d", EntrySize, len(data))
 	}
 	le := binary.LittleEndian
-
 	*sd = SegmentDesc{}
-	// Node 1: CommDS (32 bytes)
-	sd.CommDs = *(*merkletree.Node)(data[:merkletree.NodeSize])
 
-	// Node 2 layout (32 bytes = 254 bits usable):
-	// Offset (64 bits = 8 bytes) | Size (64 bits = 8 bytes) | RawSize (64 bits = 8 bytes) | Multicodec (64 bits = 8 bytes)
-	// Note: FRC-1216 specifies RawSize as 62 bits, but we use 64 bits for simplicity
-	offset := merkletree.NodeSize
-	sd.Offset = le.Uint64(data[offset:])
-	offset += 8
-	sd.Size = le.Uint64(data[offset:])
-	offset += 8
-	sd.RawSize = le.Uint64(data[offset:])
-	offset += 8
-	sd.Multicodec = le.Uint64(data[offset:])
-	offset += 8
+	// Node 1: CommData 254 bits (31 bytes + 6 bits of byte 31)
+	copy(sd.CommData[:], data[:32])
+	sd.CommData[31] &= 0xFC // keep only top 6 bits in Node1
 
-	// Node 3: MulticodecDependent (32 bytes)
-	sd.MulticodecDependent = *(*merkletree.Node)(data[offset:])
-	offset += merkletree.NodeSize
+	// Node 2: Multicodec (64) | Multihash (64) | Reserved (124 bits) | last 2 bits of CommData
+	off := merkletree.NodeSize
+	sd.Multicodec = le.Uint64(data[off:])
+	off += 8
+	sd.Multihash = le.Uint64(data[off:])
+	off += 8
+	// bytes 16-30 reserved; byte 31 of Node2: low 2 bits = CommData last 2 bits (index 32+31=63)
+	sd.CommData[31] |= data[off+15] & 0x03
+	off += 16                     // skip to end of Node2 (off was 48, 48+16=64)
+	off = 2 * merkletree.NodeSize // start of Node3
 
-	// Node 4: ACLType (1 byte) + ACLData (8 bytes) + Reserved[7:] (7 bytes) + Checksum (16 bytes)
-	sd.ACLType = data[offset]
-	offset += 1
-	sd.ACLData = le.Uint64(data[offset:])
-	offset += 8
-	copy(sd.Reserved[7:], data[offset:offset+7])
-	offset += 7
-	copy(sd.Checksum[:], data[offset:offset+ChecksumSize])
+	// Node 3: Node3Reserved (64) | Offset (64) | Size (64) | RawSize (62 bits)
+	sd.Node3Reserved = le.Uint64(data[off:])
+	off += 8
+	sd.Offset = le.Uint64(data[off:])
+	off += 8
+	sd.Size = le.Uint64(data[off:])
+	off += 8
+	sd.RawSize = le.Uint64(data[off:]) & 0x3FFFFFFFFFFFFFFF // 62 bits
+	off += 8
 
-	// Don't validate here - let the caller decide whether to validate
-	// This allows unmarshaling invalid entries for testing purposes
+	// Node 4: ACLType (8) | ACLData (64) | Reserved (56) | Checksum (126)
+	sd.ACLType = data[off]
+	off += 1
+	sd.ACLData = le.Uint64(data[off:])
+	off += 8
+	copy(sd.Reserved[7:], data[off:off+7])
+	off += 7
+	copy(sd.Checksum[:], data[off:off+ChecksumSize])
+	// Normalize to 126 bits so validation matches computeChecksum() (which truncates)
+	sd.Checksum[ChecksumSize-1] &= 0x3F
 	return nil
 }
 
@@ -257,75 +309,85 @@ func (sd *SegmentDesc) SerializeFr32() []byte {
 	return res
 }
 
-// SerializeFr32Into serializes the Segment Desctipion into given slice
-// Panics if len(slice) < EntrySize
+// SerializeFr32Into serializes the SegmentDesc into the given slice (CID-based layout).
+// Panics if len(slice) < EntrySize.
 func (sd *SegmentDesc) SerializeFr32Into(slice []byte) {
 	_ = slice[EntrySize-1]
-
 	le := binary.LittleEndian
-	offset := 0
+	off := 0
 
-	// Node 1: CommDS (32 bytes)
-	copy(slice[offset:], sd.CommDs[:])
-	offset += merkletree.NodeSize
+	// Node 1: CommData 254 bits (31 bytes + top 6 bits of byte 31)
+	copy(slice[off:], sd.CommData[:])
+	slice[off+31] &= 0xFC // clear low 2 bits in serialized Node1
+	off += merkletree.NodeSize
 
-	// Node 2 layout matches UnmarshalBinary
-	le.PutUint64(slice[offset:], sd.Offset)
-	offset += 8
-	le.PutUint64(slice[offset:], sd.Size)
-	offset += 8
-	le.PutUint64(slice[offset:], sd.RawSize)
-	offset += 8
-	le.PutUint64(slice[offset:], sd.Multicodec)
-	offset += 8
+	// Node 2: Multicodec (64) | Multihash (64) | Reserved (15 bytes) | last 2 bits = CommData[31]&0x03
+	le.PutUint64(slice[off:], sd.Multicodec)
+	off += 8
+	le.PutUint64(slice[off:], sd.Multihash)
+	off += 8
+	// bytes 16-30 zero; byte 31 = low 2 bits of CommData
+	slice[off+15] = sd.CommData[31] & 0x03
+	off += 16 // skip to end of Node 2 (bytes 48-63 reserved), so Node 3 starts at 64
 
-	// Node 3: MulticodecDependent (32 bytes)
-	copy(slice[offset:], sd.MulticodecDependent[:])
-	offset += merkletree.NodeSize
+	// Node 3: Node3Reserved (64) | Offset (64) | Size (64) | RawSize (62 bits)
+	le.PutUint64(slice[off:], sd.Node3Reserved)
+	off += 8
+	le.PutUint64(slice[off:], sd.Offset)
+	off += 8
+	le.PutUint64(slice[off:], sd.Size)
+	off += 8
+	le.PutUint64(slice[off:], sd.RawSize&0x3FFFFFFFFFFFFFFF)
+	off += 8
 
-	// Node 4: ACLType (1 byte) + ACLData (8 bytes) + Reserved[7:] (7 bytes) + Checksum (16 bytes)
-	slice[offset] = sd.ACLType
-	offset += 1
-	le.PutUint64(slice[offset:], sd.ACLData)
-	offset += 8
-	copy(slice[offset:], sd.Reserved[7:])
-	offset += 7
-	copy(slice[offset:], sd.Checksum[:])
+	// Node 4: ACLType (8) | ACLData (64) | Reserved (56) | Checksum (126)
+	slice[off] = sd.ACLType
+	off += 1
+	le.PutUint64(slice[off:], sd.ACLData)
+	off += 8
+	copy(slice[off:], sd.Reserved[7:])
+	off += 7
+	copy(slice[off:], sd.Checksum[:])
 }
 
-// IntoNodes converts the SegmentDesc directly into 4 Merkle nodes without intermediate allocation
-// This avoids the overhead of SerializeFr32() which allocates a 256-byte buffer
+// IntoNodes converts the SegmentDesc directly into 4 Merkle nodes (CID-based layout).
 func (sd *SegmentDesc) IntoNodes() [4]merkletree.Node {
 	var nodes [NodesPerEntry]merkletree.Node
 	le := binary.LittleEndian
 
-	// Node 1: CommDS (32 bytes) - direct copy
-	nodes[0] = sd.CommDs
+	// Node 1: CommData 254 bits
+	var n1 [32]byte
+	copy(n1[:], sd.CommData[:])
+	n1[31] &= 0xFC
+	nodes[0] = merkletree.Node(n1)
 
+	// Node 2: Multicodec | Multihash | Reserved | last 2 bits of CommData
 	var node2 [32]byte
-	le.PutUint64(node2[0:], sd.Offset)
-	le.PutUint64(node2[8:], sd.Size)
-	le.PutUint64(node2[16:], sd.RawSize)
-	le.PutUint64(node2[24:], sd.Multicodec)
+	le.PutUint64(node2[0:], sd.Multicodec)
+	le.PutUint64(node2[8:], sd.Multihash)
+	node2[31] = sd.CommData[31] & 0x03
 	nodes[1] = merkletree.Node(node2)
 
-	// Node 3: MulticodecDependent (32 bytes) - direct copy
-	nodes[2] = sd.MulticodecDependent
+	// Node 3: Node3Reserved | Offset | Size | RawSize (62 bits)
+	var node3 [32]byte
+	le.PutUint64(node3[0:], sd.Node3Reserved)
+	le.PutUint64(node3[8:], sd.Offset)
+	le.PutUint64(node3[16:], sd.Size)
+	le.PutUint64(node3[24:], sd.RawSize&0x3FFFFFFFFFFFFFFF)
+	nodes[2] = merkletree.Node(node3)
 
-	// Node 4 layout
+	// Node 4: ACLType | ACLData | Reserved | Checksum
 	var node4 [32]byte
 	node4[0] = sd.ACLType
 	le.PutUint64(node4[1:], sd.ACLData)
 	copy(node4[9:], sd.Reserved[7:])
 	copy(node4[16:], sd.Checksum[:])
 	nodes[3] = merkletree.Node(node4)
-
 	return nodes
 }
 
-func (sd *SegmentDesc) WithCodec(codec uint64, codecDependent merkletree.Node) *SegmentDesc {
+func (sd *SegmentDesc) WithCodec(codec uint64) *SegmentDesc {
 	sd.Multicodec = codec
-	sd.MulticodecDependent = codecDependent
 	return sd
 }
 
@@ -336,8 +398,12 @@ func (sd *SegmentDesc) WithACL(t uint8, data uint64) *SegmentDesc {
 }
 
 func (sd *SegmentDesc) Validate() error {
-	// Validate checksum
-	if sd.computeChecksum() != sd.Checksum {
+	// Validate checksum (compare normalized: computed is 126-bit, normalize stored for comparison)
+	computed := sd.computeChecksum()
+	var stored [ChecksumSize]byte
+	copy(stored[:], sd.Checksum[:])
+	stored[ChecksumSize-1] &= 0x3F
+	if computed != stored {
 		return validationError("computed checksum does not match embedded checksum")
 	}
 
@@ -351,22 +417,13 @@ func (sd *SegmentDesc) Validate() error {
 	// (which is already ensured by NewDataSegmentIndexEntry)
 
 	// Validate Multicodec (must be supported: Raw, CAR, or CID mapping section descriptor)
-	if sd.Multicodec != MulticodecRaw && sd.Multicodec != MulticodecCAR && sd.Multicodec != MulticodecCIDMappingSection {
+	if sd.Multicodec != MulticodecRaw && sd.Multicodec != MulticodecCAR && sd.Multicodec != MulticodeIndexFooter {
 		return validationError("multicodec must be 0x55 (Raw), 0x0202 (CAR), or 0xee01 (CID mapping section)")
 	}
 
-	// Validate MulticodecDependent: zero for Raw/CAR unless Reserved[7]=1 (Data CID extension).
-	// For MulticodecCIDMappingSection it must be zero.
-	// Per FRC-1216, MulticodecDependent is for "multicodec-specific metadata"; when Reserved[7]=1
-	// we use it to store the 32-byte digest of the optional Data CID (user-submitted CID for retrieval).
-	var zeroNode merkletree.Node
-	if sd.MulticodecDependent != zeroNode {
-		if sd.Multicodec == MulticodecCIDMappingSection {
-			return validationError("multicodecDependent must be zero for CID mapping section descriptor")
-		}
-		if sd.Reserved[7] != 1 {
-			return validationError("multicodecDependent must be zero for Raw and CAR codecs unless Reserved[7]=1 (Data CID)")
-		}
+	// Node3Reserved must be zero for Raw, CAR, and CID mapping section
+	if sd.Multicodec == MulticodeIndexFooter && sd.Node3Reserved != 0 {
+		return validationError("node3Reserved must be zero for CID mapping section descriptor")
 	}
 
 	// Validate ACLType and ACLData
@@ -403,8 +460,8 @@ func (sd *SegmentDesc) Validate() error {
 
 // ==============================
 
-// CBOR array length: 10 fields for v2 (CommDs, Offset, Size, RawSize, Multicodec, MulticodecDependent, ACLType, ACLData, Reserved, Checksum)
-var lengthBufSegmentDesc = []byte{0x8a}
+// CBOR array length: 11 fields for v2 (CommData, Offset, Size, RawSize, Multicodec, Multihash, Node3Reserved, ACLType, ACLData, Reserved, Checksum)
+var lengthBufSegmentDesc = []byte{0x8b}
 
 func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
 	if t == nil {
@@ -418,10 +475,10 @@ func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.CommDs))); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.CommData))); err != nil {
 		return err
 	}
-	if _, err := cw.Write(t.CommDs[:]); err != nil {
+	if _, err := cw.Write(t.CommData[:]); err != nil {
 		return err
 	}
 	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Offset)); err != nil {
@@ -436,10 +493,10 @@ func (t *SegmentDesc) MarshalCBOR(w io.Writer) error {
 	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Multicodec)); err != nil {
 		return err
 	}
-	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.MulticodecDependent))); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Multihash)); err != nil {
 		return err
 	}
-	if _, err := cw.Write(t.MulticodecDependent[:]); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Node3Reserved)); err != nil {
 		return err
 	}
 	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.ACLType)); err != nil {
@@ -482,11 +539,11 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 		return fmt.Errorf("cbor input should be of type array")
 	}
 	numFields := extra
-	if numFields != 5 && numFields != 10 {
-		return fmt.Errorf("cbor input had wrong number of fields (expected 5 or 10, got %d)", numFields)
+	if numFields != 5 && numFields != 11 {
+		return fmt.Errorf("cbor input had wrong number of fields (expected 5 or 11, got %d)", numFields)
 	}
 
-	// t.CommDs (merkletree.Node)
+	// t.CommData (32 bytes)
 
 	maj, extra, err = cr.ReadHeader()
 	if err != nil {
@@ -494,19 +551,17 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 	}
 
 	if extra > cbg.ByteArrayMaxLen {
-		return fmt.Errorf("t.CommDs: byte array too large (%d)", extra)
+		return fmt.Errorf("t.CommData: byte array too large (%d)", extra)
 	}
 	if maj != cbg.MajByteString {
 		return fmt.Errorf("expected byte array")
 	}
 
 	if extra != 32 {
-		return fmt.Errorf("expected array to have 32 elements")
+		return fmt.Errorf("expected CommData to have 32 elements")
 	}
 
-	t.CommDs = [32]uint8{}
-
-	if _, err := io.ReadFull(cr, t.CommDs[:]); err != nil {
+	if _, err := io.ReadFull(cr, t.CommData[:]); err != nil {
 		return err
 	}
 	// t.Offset
@@ -539,34 +594,26 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 	}
 	t.RawSize = uint64(extra)
 
-	// t.Checksum ([16]uint8)
-
-	maj, extra, err = cr.ReadHeader()
-	if err != nil {
-		return err
-	}
-
-	if extra > cbg.ByteArrayMaxLen {
-		return fmt.Errorf("t.Checksum: byte array too large (%d)", extra)
-	}
-	if maj != cbg.MajByteString {
-		return fmt.Errorf("expected byte array")
-	}
-
-	if extra != 16 {
-		return fmt.Errorf("expected array to have 16 elements")
-	}
-
-	t.Checksum = [16]uint8{}
-
-	if _, err := io.ReadFull(cr, t.Checksum[:]); err != nil {
-		return err
-	}
-	// Legacy 5-field format: set v2 defaults and return
+	// Legacy 5-field format: 5th field is Checksum; then set v2 defaults and return
 	if numFields == 5 {
+		maj, extra, err = cr.ReadHeader()
+		if err != nil {
+			return err
+		}
+		if extra > cbg.ByteArrayMaxLen {
+			return fmt.Errorf("t.Checksum: byte array too large (%d)", extra)
+		}
+		if maj != cbg.MajByteString || extra != 16 {
+			return fmt.Errorf("expected 16-byte checksum")
+		}
+		if _, err := io.ReadFull(cr, t.Checksum[:]); err != nil {
+			return err
+		}
 		t.Multicodec = MulticodecRaw
 		return nil
 	}
+
+	// 11-field v2 format: Multicodec, Multihash, Node3Reserved, ACLType, ACLData, Reserved, Checksum
 	// t.Multicodec
 	maj, extra, err = cr.ReadHeader()
 	if err != nil {
@@ -576,17 +623,24 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 		return fmt.Errorf("wrong type for multicodec")
 	}
 	t.Multicodec = uint64(extra)
-	// t.MulticodecDependent (32 bytes)
+	// t.Multihash
 	maj, extra, err = cr.ReadHeader()
 	if err != nil {
 		return err
 	}
-	if maj != cbg.MajByteString || extra != 32 {
-		return fmt.Errorf("multicodecDependent: expected byte array of 32, got type/len %d/%d", maj, extra)
+	if maj != cbg.MajUnsignedInt {
+		return fmt.Errorf("wrong type for multihash")
 	}
-	if _, err := io.ReadFull(cr, t.MulticodecDependent[:]); err != nil {
+	t.Multihash = uint64(extra)
+	// t.Node3Reserved
+	maj, extra, err = cr.ReadHeader()
+	if err != nil {
 		return err
 	}
+	if maj != cbg.MajUnsignedInt {
+		return fmt.Errorf("wrong type for node3Reserved")
+	}
+	t.Node3Reserved = uint64(extra)
 	// t.ACLType
 	maj, extra, err = cr.ReadHeader()
 	if err != nil {
@@ -619,6 +673,20 @@ func (t *SegmentDesc) UnmarshalCBOR(r io.Reader) (err error) {
 		if _, err := io.ReadFull(cr, t.Reserved[:n]); err != nil {
 			return err
 		}
+	}
+	// t.Checksum (16 bytes)
+	maj, extra, err = cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	if extra > cbg.ByteArrayMaxLen {
+		return fmt.Errorf("t.Checksum: byte array too large (%d)", extra)
+	}
+	if maj != cbg.MajByteString || extra != 16 {
+		return fmt.Errorf("expected 16-byte checksum")
+	}
+	if _, err := io.ReadFull(cr, t.Checksum[:]); err != nil {
+		return err
 	}
 	return nil
 }
