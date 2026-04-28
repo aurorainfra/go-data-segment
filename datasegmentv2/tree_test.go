@@ -8,7 +8,7 @@ import (
 
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-data-segment/util"
-	commp2 "github.com/filecoin-project/go-fil-commp-hashhash/commp2"
+	commp "github.com/filecoin-project/go-fil-commp-hashhash"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -715,7 +715,7 @@ func TestSectorTree_ProofConsistency(t *testing.T) {
 	}
 }
 
-// verifyCommPWithCommp2 verifies that the SectorTree's root matches commp2's calculation
+// verifyCommPWithCommp verifies that the SectorTree's root matches commpv1's calculation
 func verifyCommPWithCommp2(t *testing.T, tree *SectorTree, pieces []PieceData, sectorSize uint64) {
 	// Calculate sector size if not provided
 	if sectorSize == 0 {
@@ -752,10 +752,10 @@ func verifyCommPWithCommp2(t *testing.T, tree *SectorTree, pieces []PieceData, s
 		copy(sectorData[piece.BeginAt:piece.BeginAt+piece.RawSize], pieceData)
 	}
 
-	// Use commp2 to calculate the CommP for the entire sector
-	// IMPORTANT: commp2 processes data as a continuous stream, which matches how SectorTree builds the tree
+	// Use commpv1 to calculate the CommP for the entire sector
+	// commpv1 processes data as a continuous stream, which matches how SectorTree builds the tree
 	// We write the complete sector data as a continuous stream to match SectorTree's behavior
-	calc := commp2.Calc{}
+	calc := commp.Calc{}
 
 	// Write the entire sector data at once (as a continuous stream, matching SectorTree)
 	n, err := calc.Write(sectorData)

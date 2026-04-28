@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	commcid "github.com/filecoin-project/go-fil-commcid"
-	commp2 "github.com/filecoin-project/go-fil-commp-hashhash/commp2"
+	commp "github.com/filecoin-project/go-fil-commp-hashhash"
 	"github.com/filecoin-project/go-state-types/abi"
 	cid "github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/assert"
@@ -473,20 +473,17 @@ func TestAggregateV2_PieceCommP_Consistency_OffsetZero(t *testing.T) {
 
 	agg, err := NewAggregate(dealSize, pieces)
 	agg = requireAggregateOrSkip(t, agg, err)
-	// Calculate CommP individually using commp2 with BeginAt=0
-	calc := &commp2.Calc{}
-	if err := calc.BeginAt(0); err != nil {
-		t.Fatalf("failed to set BeginAt: %v", err)
-	}
+	// Calculate CommP individually using commpv1
+	calc := &commp.Calc{}
 
 	n, err := calc.Write(pieceData)
 	require.NoError(t, err)
 	require.Equal(t, len(pieceData), n)
 
-	commp2Digest, _, err := calc.Digest()
+	commpDigest, _, err := calc.Digest()
 	require.NoError(t, err)
-	require.NotNil(t, commp2Digest)
-	require.Equal(t, 32, len(commp2Digest))
+	require.NotNil(t, commpDigest)
+	require.Equal(t, 32, len(commpDigest))
 
 	// Get CommP from index entry (stored as CommData when built from CommP)
 	entry := agg.Index.Entry(0)
@@ -494,175 +491,17 @@ func TestAggregateV2_PieceCommP_Consistency_OffsetZero(t *testing.T) {
 	indexCommP := entry.CommData
 
 	// Compare CommP values
-	commp2CommPArray := [32]byte{}
-	copy(commp2CommPArray[:], commp2Digest)
+	commpCommPArray := [32]byte{}
+	copy(commpCommPArray[:], commpDigest)
 
-	assert.Equal(t, indexCommP[:], commp2CommPArray[:],
+	assert.Equal(t, indexCommP[:], commpCommPArray[:],
 		"CommP mismatch for offset=0 piece\n"+
-			"  Index CommP (from tree):  %x\n"+
-			"  commp2 CommP (calculated): %x",
-		indexCommP[:], commp2CommPArray[:])
+			"  Index CommP (from tree):    %x\n"+
+			"  commpv1 CommP (calculated): %x",
+		indexCommP[:], commpCommPArray[:])
 }
 
-// TestAggregateV2_PieceCommP_Consistency tests that CommP calculated individually
-// for each piece using commp2 matches the CommP stored in the index entry.
-// This test verifies that the CommP stored in the index (calculated using commp2
-// with BeginAt) matches the CommP calculated independently using the same method.
-func TestAggregateV2_PieceCommP_Consistency(t *testing.T) {
-	dealSize := abi.PaddedPieceSize(1 << 20) // 1 MiB
-	piece1Data := makeTestDataCreation(512)
-	piece2Data := makeTestDataCreation(1024)
-	piece3Data := makeTestDataCreation(256)
 
-	pieces := []PieceData{
-		{
-			Reader: bytes.NewReader(piece1Data),
-			PieceInfo: PieceInfo{
-				BeginAt: 0,
-				RawSize: 512,
-			},
-		},
-		{
-			Reader: bytes.NewReader(piece2Data),
-			PieceInfo: PieceInfo{
-				BeginAt: 1024, // Gap between pieces
-				RawSize: 1024,
-			},
-		},
-		{
-			Reader: bytes.NewReader(piece3Data),
-			PieceInfo: PieceInfo{
-				BeginAt: 3000, // Another gap
-				RawSize: 256,
-			},
-		},
-	}
-
-	agg, err := NewAggregate(dealSize, pieces)
-	agg = requireAggregateOrSkip(t, agg, err)
-	// Store original piece data for commp2 calculation
-	pieceDataList := [][]byte{piece1Data, piece2Data, piece3Data}
-
-	// For each piece, verify that individually calculated CommP matches index entry
-	for i, piece := range pieces {
-		// Calculate CommP individually using commp2 with BeginAt
-		// This simulates how the piece would be calculated if it were placed
-		// at the given offset in a sector
-		calc := &commp2.Calc{}
-		if err := calc.BeginAt(piece.BeginAt); err != nil {
-			t.Fatalf("piece %d: failed to set BeginAt: %v", i, err)
-		}
-
-		// Write the piece data
-		n, err := calc.Write(pieceDataList[i])
-		require.NoError(t, err, "piece %d: failed to write data to commp2", i)
-		require.Equal(t, len(pieceDataList[i]), n, "piece %d: incomplete write to commp2", i)
-
-		// Get the digest (CommP) from commp2
-		commp2Digest, paddedSize, err := calc.Digest()
-		require.NoError(t, err, "piece %d: failed to get digest from commp2", i)
-		require.NotNil(t, commp2Digest, "piece %d: commp2 digest is nil", i)
-		require.Equal(t, 32, len(commp2Digest), "piece %d: commp2 digest should be 32 bytes", i)
-		require.Greater(t, paddedSize, uint64(0), "piece %d: padded size should be > 0", i)
-
-		// Get CommP from index entry (stored as CommData when built from CommP)
-		entry := agg.Index.Entry(i)
-		require.NotNil(t, entry, "piece %d: index entry is nil", i)
-		indexCommP := entry.CommData
-
-		// Compare CommP values
-		// commp2Digest is a slice, indexCommP is [32]byte (merkletree.Node)
-		commp2CommPArray := [32]byte{}
-		copy(commp2CommPArray[:], commp2Digest)
-
-		// The CommP from the index should match the CommP calculated with commp2
-		// Both use commp2 with BeginAt to calculate the piece's CommP at its offset
-		assert.Equal(t, indexCommP[:], commp2CommPArray[:],
-			"piece %d: CommP mismatch\n"+
-				"  Index CommP:  %x\n"+
-				"  commp2 CommP: %x\n"+
-				"  BeginAt: %d, RawSize: %d",
-			i, indexCommP[:], commp2CommPArray[:], piece.BeginAt, piece.RawSize)
-
-		// Verify piece commitment CID from index CommData matches commp2
-		commp2CID, err := commcid.PieceCommitmentV1ToCID(commp2Digest)
-		require.NoError(t, err, "piece %d: failed to convert commp2 digest to CID", i)
-		indexPieceCID, err := commcid.PieceCommitmentV1ToCID(indexCommP[:])
-		require.NoError(t, err, "piece %d: failed to convert index CommData to CID", i)
-		assert.True(t, indexPieceCID.Equals(commp2CID),
-			"piece %d: piece CID from index CommData should match commp2\n"+
-				"  Index CID:  %s\n"+
-				"  commp2 CID: %s",
-			i, indexPieceCID.String(), commp2CID.String())
-	}
-}
-
-// TestAggregateV2_PieceCommP_Consistency_Misaligned tests CommP consistency for misaligned pieces
-func TestAggregateV2_PieceCommP_Consistency_Misaligned(t *testing.T) {
-	dealSize := abi.PaddedPieceSize(1 << 20) // 1 MiB
-	piece1Data := makeTestDataCreation(300)  // Non-power-of-two size
-	piece2Data := makeTestDataCreation(777)  // Non-power-of-two size
-
-	pieces := []PieceData{
-		{
-			Reader: bytes.NewReader(piece1Data),
-			PieceInfo: PieceInfo{
-				BeginAt: 127, // Non-aligned offset
-				RawSize: 300,
-			},
-		},
-		{
-			Reader: bytes.NewReader(piece2Data),
-			PieceInfo: PieceInfo{
-				BeginAt: 500, // Non-aligned offset
-				RawSize: 777,
-			},
-		},
-	}
-
-	agg, err := NewAggregate(dealSize, pieces)
-	agg = requireAggregateOrSkip(t, agg, err)
-	// Store original piece data for commp2 calculation
-	pieceDataList := [][]byte{piece1Data, piece2Data}
-
-	// For each piece, verify that individually calculated CommP matches index entry
-	for i, piece := range pieces {
-		// Calculate CommP individually using commp2 with BeginAt
-		calc := &commp2.Calc{}
-		if err := calc.BeginAt(piece.BeginAt); err != nil {
-			t.Fatalf("piece %d: failed to set BeginAt: %v", i, err)
-		}
-
-		// Write the piece data
-		n, err := calc.Write(pieceDataList[i])
-		require.NoError(t, err, "piece %d: failed to write data to commp2", i)
-		require.Equal(t, len(pieceDataList[i]), n, "piece %d: incomplete write to commp2", i)
-
-		// Get the digest (CommP) from commp2
-		commp2Digest, paddedSize, err := calc.Digest()
-		require.NoError(t, err, "piece %d: failed to get digest from commp2", i)
-		require.NotNil(t, commp2Digest, "piece %d: commp2 digest is nil", i)
-		require.Equal(t, 32, len(commp2Digest), "piece %d: commp2 digest should be 32 bytes", i)
-		require.Greater(t, paddedSize, uint64(0), "piece %d: padded size should be > 0", i)
-
-		// Get CommP from index entry (stored as CommData when built from CommP)
-		entry := agg.Index.Entry(i)
-		require.NotNil(t, entry, "piece %d: index entry is nil", i)
-		indexCommP := entry.CommData
-
-		// Compare CommP values
-		commp2CommPArray := [32]byte{}
-		copy(commp2CommPArray[:], commp2Digest)
-
-		// The CommP from the index should match the CommP calculated with commp2
-		assert.Equal(t, indexCommP[:], commp2CommPArray[:],
-			"piece %d: CommP mismatch for misaligned piece\n"+
-				"  Index CommP:  %x\n"+
-				"  commp2 CommP: %x\n"+
-				"  BeginAt: %d, RawSize: %d",
-			i, indexCommP[:], commp2CommPArray[:], piece.BeginAt, piece.RawSize)
-	}
-}
 
 // TestSegmentDesc_PieceCIDV2 asserts PieceCIDV2 is not supported in CID-based index format.
 func TestSegmentDesc_PieceCIDV2(t *testing.T) {

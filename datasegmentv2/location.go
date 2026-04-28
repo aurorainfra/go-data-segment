@@ -1,9 +1,6 @@
 package datasegmentv2
 
 import (
-	"io"
-
-	"github.com/filecoin-project/go-fil-commp-hashhash/commp2"
 	"golang.org/x/xerrors"
 )
 
@@ -39,31 +36,7 @@ func ComputePieceLeafRange(piece PieceData) (*PieceLeafRange, error) {
 		return nil, xerrors.Errorf("piece RawSize cannot be zero")
 	}
 
-	// Read piece data
-	pieceData, err := io.ReadAll(piece.Reader)
-	if err != nil {
-		return nil, xerrors.Errorf("reading piece data: %w", err)
-	}
-	if uint64(len(pieceData)) != piece.RawSize {
-		return nil, xerrors.Errorf("piece data size mismatch: expected %d, got %d",
-			piece.RawSize, len(pieceData))
-	}
-
-	// Use commp2 to compute the piece's layout
-	// This ensures we use the same algorithm as commp2 for calculating leaf positions
-	calc := &commp2.Calc{}
-	
-	// Set the offset (BeginAt sets bufStartOffset)
-	if err := calc.BeginAt(piece.BeginAt); err != nil {
-		return nil, xerrors.Errorf("setting BeginAt offset: %w", err)
-	}
-
-	// Write the piece data
-	if _, err := calc.Write(pieceData); err != nil {
-		return nil, xerrors.Errorf("writing piece data: %w", err)
-	}
-
-	// Calculate leaf range based on commp2's algorithm
+	// Calculate leaf range based on FR32 encoding algorithm
 	// The calculation matches commp2's processBuffer logic:
 	// - startQuad = BeginAt / 127
 	// - posInFirstQuad = BeginAt % 127
