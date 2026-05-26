@@ -19,7 +19,6 @@ func main() {
 		datasegment.DataAggregationProof{},
 		datasegment.SingletonMarketSource{},
 
-		datasegment.SegmentDesc{},
 		datasegment.IndexData{},
 	); err != nil {
 		panic(err)
