@@ -17,6 +17,9 @@ import (
 type InclusionVerifierData struct {
 	// Piece Commitment to client's data
 	CommPc cid.Cid
+	// DataCID is the content CID stored in the v2 index entry. If omitted, the
+	// verifier falls back to the legacy CommP-style index entry reconstruction.
+	DataCID cid.Cid
 	// Offset is the pre-Fr32-padding offset of the piece in the aggregate
 	Offset uint64
 	// SizePc is size of client's data (pre-Fr32-padding, raw size)
@@ -129,7 +132,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(verifierData InclusionVerifierDa
 
 	endPostFr32 := ((verifierData.Offset+verifierData.SizePc)*128 + 126) / 127
 	endLeaf := (endPostFr32 + merkletree.NodeSize - 1) / merkletree.NodeSize
-	
+
 	// Ensure endLeaf is at least beginLeaf + 1
 	if endLeaf <= beginLeaf {
 		endLeaf = beginLeaf + 1
@@ -147,7 +150,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(verifierData InclusionVerifierDa
 	// The proof path goes from leaf (index 0) to root
 	// We need to take the path segment starting from piece root level
 	proofPathFromPieceRoot := ip.LeftProofSubtree.Path[levelsUpToPieceRoot:]
-	
+
 	// Calculate piece root index by traversing from leftmost leaf index up to piece root level
 	// This is what ComputeRoot expects: the index of the starting node (piece root) at its level
 	// We need to traverse from the leftmost leaf index (ip.LeftProofSubtree.Index) up to piece root level
@@ -155,7 +158,7 @@ func (ip InclusionProof) ComputeExpectedAuxData(verifierData InclusionVerifierDa
 	for i := 0; i < levelsUpToPieceRoot; i++ {
 		pieceRootIndexInProof = pieceRootIndexInProof >> 1
 	}
-	
+
 	// Verify that our calculated index matches what FindSubtreeRoot returned
 	// They should be the same, but if not, use the calculated one as it's based on the actual proof structure
 	if pieceRootIndexInProof != pieceRootIndexAtLevel {
@@ -196,13 +199,22 @@ func (ip InclusionProof) ComputeExpectedAuxData(verifierData InclusionVerifierDa
 		}
 	}
 
-	// Create the DataSegmentIndexEntry based on Client's data and offset
-	// In v2, we use the offset from verifierData
-	en := NewDataSegmentIndexEntry(
-		(*fr32.Fr32)(&nodeCommPc),
-		verifierData.Offset,
-		verifierData.SizePc,
-	).WithUpdatedChecksum()
+	// Create the DataSegmentIndexEntry based on the client's index data and offset.
+	// CID-based v2 entries use DataCID; older tests may still reconstruct from CommP.
+	var en *SegmentDesc
+	if verifierData.DataCID.Defined() {
+		en, err = NewDataSegmentIndexEntryFromCID(verifierData.DataCID, verifierData.Offset, verifierData.SizePc)
+		if err != nil {
+			return nil, xerrors.Errorf("creating index entry from data CID: %w", err)
+		}
+		en.WithUpdatedChecksum()
+	} else {
+		en = NewDataSegmentIndexEntry(
+			(*fr32.Fr32)(&nodeCommPc),
+			verifierData.Offset,
+			verifierData.SizePc,
+		).WithUpdatedChecksum()
+	}
 
 	// In v2, each index entry consists of 4 nodes forming a small subtree
 	// We need to compute the Merkle root of these 4 nodes

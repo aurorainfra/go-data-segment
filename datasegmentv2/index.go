@@ -3,14 +3,15 @@ package datasegmentv2
 import (
 	"bytes"
 	"encoding"
-	"encoding/binary"
 	"io"
+	"math"
 
 	"github.com/filecoin-project/go-data-segment/util"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/multiformats/go-multihash"
+	_ "github.com/multiformats/go-multihash/register/blake3"
 	"golang.org/x/xerrors"
 )
 
@@ -48,8 +49,10 @@ func MaxIndexEntriesInDeal(dealSize abi.PaddedPieceSize) uint {
 	return res
 }
 
-// IndexDataV2 holds the data segment index (v2, CID-based). Each entry carries CommData+Multihash+Multicodec,
-// so the content CID is derivable via entry.DataCID(); no separate CidMappings section is needed.
+// IndexDataV2 holds the data segment index (v2, CID-based). Each data entry carries
+// CommData+Multihash+Multicodec, so the content CID is derivable via entry.DataCID().
+// The serialized index ends with a descriptor entry whose CommData is the BLAKE3 hash
+// of the preceding serialized index bytes and whose Offset/Size locate the index section.
 type IndexDataV2 struct {
 	Entries []*SegmentDesc
 	Offset  int64
@@ -57,9 +60,9 @@ type IndexDataV2 struct {
 
 var _ PieceIndex = (*IndexDataV2)(nil)
 
-// ParseIndexSection reads the index section from the sector. The sector tail is the index only (no separate
-// CID mapping section). It reads the last 128 bytes (sentinel), uses its Offset and Size to read the full
-// index block, then unmarshals the entries.
+// ParseIndexSection reads the index section from the sector. The sector tail is the
+// index. It reads the last 128 bytes (descriptor), uses its Offset and Size to read
+// the full index block, verifies the BLAKE3 digest, then unmarshals the data entries.
 func (id *IndexDataV2) ParseIndexSection(reader io.ReaderAt, size int64) error {
 	indexLog.Infof("parse index section: sector size %v", size)
 	if size < int64(EntrySize) {
@@ -76,10 +79,16 @@ func (id *IndexDataV2) ParseIndexSection(reader io.ReaderAt, size int64) error {
 	}
 	var sentinel SegmentDesc
 	if err := sentinel.UnmarshalBinary(lastEntryBuf); err != nil {
-		return xerrors.Errorf("unmarshal sentinel entry: %w", err)
+		return xerrors.Errorf("unmarshal index descriptor entry: %w", err)
 	}
-	if sentinel.Multicodec != uint64(MulticodeIndexFooter) {
-		return xerrors.Errorf("last entry is not index section descriptor (multicodec=%d)", sentinel.Multicodec)
+	if err := validateIndexDescriptor(&sentinel, nil); err != nil {
+		return xerrors.Errorf("invalid index descriptor entry: %w", err)
+	}
+	if sentinel.Offset > uint64(size) || sentinel.Size > uint64(size)-sentinel.Offset {
+		return xerrors.Errorf("invalid index descriptor: offset=%d size=%d sectorSize=%d", sentinel.Offset, sentinel.Size, size)
+	}
+	if sentinel.Offset+sentinel.Size != uint64(size) {
+		return xerrors.Errorf("invalid index descriptor: offset=%d size=%d does not end at sector size %d", sentinel.Offset, sentinel.Size, size)
 	}
 	indexOff := int64(sentinel.Offset)
 	indexSize := int64(sentinel.Size)
@@ -94,6 +103,9 @@ func (id *IndexDataV2) ParseIndexSection(reader io.ReaderAt, size int64) error {
 	}
 	if int64(n) < indexSize {
 		return xerrors.Errorf("short read for index block: got %d want %d", n, indexSize)
+	}
+	if err := validateIndexDescriptor(&sentinel, indexBlock[:len(indexBlock)-EntrySize]); err != nil {
+		return xerrors.Errorf("invalid index descriptor digest: %w", err)
 	}
 	return id.UnmarshalBinary(indexBlock)
 }
@@ -111,7 +123,7 @@ func (id *IndexDataV2) Entry(idx int) *SegmentDesc {
 	return id.Entries[idx]
 }
 
-// Search finds the index of a segment by its content CID (multihash + digest).
+// Search finds the index of a segment by its content CID (codec + multihash + digest).
 // Returns -1 if not found.
 func (id *IndexDataV2) Search(c cid.Cid) int {
 	if !c.Defined() {
@@ -129,7 +141,7 @@ func (id *IndexDataV2) Search(c cid.Cid) int {
 		if e == nil {
 			continue
 		}
-		if e.Multihash == pref.MhType && bytes.Equal(e.CommData[:], wantCommData[:]) {
+		if e.Multicodec == pref.Codec && e.Multihash == pref.MhType && bytes.Equal(e.CommData[:], wantCommData[:]) {
 			return i
 		}
 	}
@@ -166,16 +178,28 @@ func (id *IndexDataV2) ListPieces() []*SegmentDesc {
 	return entries
 }
 
-// IndexSize returns the size of the index. Defined to be number of entries * EntrySize (128 bytes for v2).
+// IndexSize returns the serialized size of the index entries plus the descriptor.
 func (i *IndexDataV2) IndexSize() uint64 {
-	return uint64(i.NumPieces()) * uint64(EntrySize)
+	return uint64(i.NumPieces()+1) * uint64(EntrySize)
 }
 
-// MarshalBinary produces the index section only: [entry0][entry1]...[sentinel]. No separate CID mapping section;
-// each entry's CID is derivable via entry.DataCID(). The returned bytes are written at sector offset id.Offset.
+// MarshalBinary produces the index section only: [entry0][entry1]...[descriptor].
+// No separate CID mapping section is needed; each entry's CID is derivable via
+// entry.DataCID(). The returned bytes are written at sector offset id.Offset.
 func (id *IndexDataV2) MarshalBinary() (data []byte, err error) {
+	return id.marshalBinaryWithEntryCount(len(id.Entries) + 1)
+}
+
+func (id *IndexDataV2) marshalBinaryWithEntryCount(totalEntries int) (data []byte, err error) {
 	entriesCnt := len(id.Entries)
-	indexSectionLen := EntrySize * (entriesCnt + 1)
+	if totalEntries < entriesCnt+1 {
+		return nil, xerrors.Errorf("total index entries %d must fit %d data entries plus descriptor", totalEntries, entriesCnt)
+	}
+	if id.Offset < 0 {
+		return nil, xerrors.Errorf("index offset cannot be negative: %d", id.Offset)
+	}
+
+	indexSectionLen := EntrySize * totalEntries
 	indexSection := make([]byte, indexSectionLen)
 	for i, r := range id.Entries {
 		if r != nil {
@@ -184,28 +208,20 @@ func (id *IndexDataV2) MarshalBinary() (data []byte, err error) {
 	}
 	indexOffset := uint64(id.Offset)
 	indexSize := uint64(indexSectionLen)
-	sentinel := NewDataSegmentIndexEntryFromMultihash(0, nil, indexOffset, indexSize)
-	sentinel.Size = indexSize
-	sentinel.RawSize = indexSize
-	sentinel.WithCodec(MulticodeIndexFooter).WithUpdatedChecksum()
-	sentinelSlice := indexSection[entriesCnt*EntrySize : (entriesCnt+1)*EntrySize]
-	sentinel.SerializeFr32Into(sentinelSlice)
-	// Ensure Node3 (Offset/Size/RawSize) is written for ParseIndexSection; patch and recompute checksum
-	le := binary.LittleEndian
-	le.PutUint64(sentinelSlice[72:], indexOffset)
-	le.PutUint64(sentinelSlice[80:], indexSize)
-	le.PutUint64(sentinelSlice[88:], indexSize&0x3FFFFFFFFFFFFFFF)
-	var sentinelDec SegmentDesc
-	if err := sentinelDec.UnmarshalBinary(sentinelSlice); err != nil {
+	payloadLen := indexSectionLen - EntrySize
+	descriptor, err := newIndexDescriptor(indexOffset, indexSize, indexSection[:payloadLen])
+	if err != nil {
 		return nil, err
 	}
-	cs := sentinelDec.computeChecksum()
-	copy(sentinelSlice[112:], cs[:])
+	descriptorSlice := indexSection[payloadLen:indexSectionLen]
+	descriptor.SerializeFr32Into(descriptorSlice)
 	return indexSection, nil
 }
 
-// UnmarshalBinary parses the index-only layout from MarshalBinary: a sequence of SegmentDesc entries,
-// with the last one being the index section descriptor (MulticodeIndexFooter), which is not added to Entries.
+// UnmarshalBinary parses the index-only layout from MarshalBinary: a sequence of
+// SegmentDesc entries with the last one being the index descriptor, which is not
+// added to Entries. Zero entries before the descriptor are treated as reserved
+// padding and ignored.
 func (id *IndexDataV2) UnmarshalBinary(data []byte) error {
 	if rem := len(data) % EntrySize; rem != 0 {
 		return xerrors.Errorf("index data is not a multiple of EntrySize: %d %% %d != 0", len(data), EntrySize)
@@ -215,15 +231,30 @@ func (id *IndexDataV2) UnmarshalBinary(data []byte) error {
 		return xerrors.Errorf("index data has no entries")
 	}
 	indexLog.Infof("unmarshaling index: %d raw entries", numEntries)
-	*id = IndexDataV2{}
+	var descriptor SegmentDesc
+	if err := descriptor.UnmarshalBinary(data[len(data)-EntrySize:]); err != nil {
+		return xerrors.Errorf("unmarshal index descriptor entry: %w", err)
+	}
+	if err := validateIndexDescriptor(&descriptor, data[:len(data)-EntrySize]); err != nil {
+		return xerrors.Errorf("invalid index descriptor entry: %w", err)
+	}
+	if descriptor.Size != uint64(len(data)) {
+		return xerrors.Errorf("index descriptor size %d does not match data length %d", descriptor.Size, len(data))
+	}
+	if descriptor.Offset > math.MaxInt64 {
+		return xerrors.Errorf("index descriptor offset overflows int64: %d", descriptor.Offset)
+	}
+
+	*id = IndexDataV2{Offset: int64(descriptor.Offset)}
 	id.Entries = make([]*SegmentDesc, 0, numEntries-1)
-	for i := 0; i < numEntries; i++ {
-		var entry SegmentDesc
-		if err := entry.UnmarshalBinary(data[i*EntrySize : (i+1)*EntrySize]); err != nil {
-			return xerrors.Errorf("unmarshal entry at index %d: %w", i, err)
-		}
-		if entry.Multicodec == uint64(MulticodeIndexFooter) {
+	for i := 0; i < numEntries-1; i++ {
+		entryData := data[i*EntrySize : (i+1)*EntrySize]
+		if isZeroEntry(entryData) {
 			continue
+		}
+		var entry SegmentDesc
+		if err := entry.UnmarshalBinary(entryData); err != nil {
+			return xerrors.Errorf("unmarshal entry at index %d: %w", i, err)
 		}
 		if err := entry.Validate(); err != nil {
 			return xerrors.Errorf("entry at index %v is invalid: %v", i, err)
@@ -231,4 +262,72 @@ func (id *IndexDataV2) UnmarshalBinary(data []byte) error {
 		id.Entries = append(id.Entries, &entry)
 	}
 	return nil
+}
+
+func newIndexDescriptor(indexOffset uint64, indexSize uint64, payload []byte) (*SegmentDesc, error) {
+	digest, err := blake3Digest(payload)
+	if err != nil {
+		return nil, err
+	}
+	descriptor := NewDataSegmentIndexEntryFromMultihash(MultihashBlake3, digest[:], indexOffset, indexSize)
+	descriptor.Size = indexSize
+	descriptor.RawSize = indexSize
+	return descriptor.WithCodec(MulticodecIdentity).WithUpdatedChecksum(), nil
+}
+
+func validateIndexDescriptor(entry *SegmentDesc, payload []byte) error {
+	if entry.Multicodec != MulticodecIdentity {
+		return xerrors.Errorf("multicodec must be identity (0), got %d", entry.Multicodec)
+	}
+	if entry.Multihash != MultihashBlake3 {
+		return xerrors.Errorf("multihash must be blake3 (%d), got %d", MultihashBlake3, entry.Multihash)
+	}
+	if entry.Size < EntrySize || entry.Size%EntrySize != 0 {
+		return xerrors.Errorf("size must be a positive multiple of EntrySize: %d", entry.Size)
+	}
+	if entry.RawSize != entry.Size {
+		return xerrors.Errorf("raw size must match size: %d != %d", entry.RawSize, entry.Size)
+	}
+	if err := entry.Validate(); err != nil {
+		return err
+	}
+	if payload != nil {
+		digest, err := blake3Digest(payload)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(entry.CommData[:], digest[:]) {
+			return xerrors.Errorf("blake3 digest mismatch")
+		}
+	}
+	return nil
+}
+
+func blake3Digest(data []byte) ([32]byte, error) {
+	mh, err := multihash.Sum(data, MultihashBlake3, 32)
+	if err != nil {
+		return [32]byte{}, xerrors.Errorf("computing blake3 multihash: %w", err)
+	}
+	decoded, err := multihash.Decode(mh)
+	if err != nil {
+		return [32]byte{}, xerrors.Errorf("decoding blake3 multihash: %w", err)
+	}
+	if decoded.Code != MultihashBlake3 {
+		return [32]byte{}, xerrors.Errorf("unexpected blake3 multihash code: %d", decoded.Code)
+	}
+	if len(decoded.Digest) != 32 {
+		return [32]byte{}, xerrors.Errorf("unexpected blake3 digest length: %d", len(decoded.Digest))
+	}
+	var digest [32]byte
+	copy(digest[:], decoded.Digest)
+	return digest, nil
+}
+
+func isZeroEntry(data []byte) bool {
+	for _, b := range data {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }

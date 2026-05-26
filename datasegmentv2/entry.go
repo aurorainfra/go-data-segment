@@ -27,14 +27,14 @@ const EntrySize = NodesPerEntry * merkletree.NodeSize // 128 bytes (4 nodes of 3
 
 // Multicodec values
 const (
-	MulticodecRaw        = 0x55   // Raw binary data
-	MulticodecCAR        = 0x0202 // CAR format (IPLD)
-	MulticodeIndexFooter = 0xee01 // Special entry: describes the CID mapping section (Offset + Size in this sector)
+	MulticodecIdentity = 0x00   // Identity codec, used by the index descriptor entry
+	MulticodecRaw      = 0x55   // Raw binary data
+	MulticodecCAR      = 0x0202 // CAR format (IPLD)
 )
 
 // Multihash codes (multicodec table)
 const (
-	MultihashBlake3 = 0x1e // BLAKE3-256, 32-byte digest
+	MultihashBlake3 = multihash.BLAKE3 // BLAKE3-256, 32-byte digest
 )
 
 // SegmentDesc contains a data segment description (v2 format, CID-based).
@@ -70,7 +70,7 @@ func (sd SegmentDesc) DataCID() (cid.Cid, error) {
 }
 
 // PieceCID returns the content CID (same as DataCID) for compatibility.
-// Panics if the entry cannot form a valid CID (e.g. zero Multihash for sentinel entries).
+// Panics if the entry cannot form a valid CID (e.g. zero Multihash with empty digest).
 func (sd SegmentDesc) PieceCID() cid.Cid {
 	c, err := sd.DataCID()
 	if err != nil {
@@ -205,7 +205,7 @@ func NewDataSegmentIndexEntryFromCID(c cid.Cid, offset uint64, rawSize uint64) (
 }
 
 // NewDataSegmentIndexEntryFromMultihash creates a SegmentDesc from multihash code and digest.
-// If digest is nil or empty, CommData is zeroed (for sentinel entries like CID mapping section).
+// If digest is nil or empty, CommData is zeroed.
 func NewDataSegmentIndexEntryFromMultihash(multihashCode uint64, digest []byte, offset uint64, rawSize uint64) *SegmentDesc {
 	var commData [32]byte
 	if len(digest) > 0 {
@@ -225,7 +225,7 @@ func NewDataSegmentIndexEntryFromMultihash(multihashCode uint64, digest []byte, 
 	}
 }
 
-// NewDataSegmentIndexEntry creates a sentinel entry with the given offset and size (e.g. CID mapping section).
+// NewDataSegmentIndexEntry creates a legacy CommP-style entry with the given offset and size.
 // CommData and Multihash are zero. Deprecated for data segments; use FromCID or FromMultihash.
 func NewDataSegmentIndexEntry(CommP *fr32.Fr32, offset uint64, rawSize uint64) *SegmentDesc {
 	if CommP == nil {
@@ -265,18 +265,18 @@ func (sd *SegmentDesc) UnmarshalBinary(data []byte) error {
 	le := binary.LittleEndian
 	*sd = SegmentDesc{}
 
-	// Node 1: CommData 254 bits (31 bytes + 6 bits of byte 31)
+	// Node 1: CommData 254 bits (31 bytes + low 6 bits of byte 31)
 	copy(sd.CommData[:], data[:32])
-	sd.CommData[31] &= 0xFC // keep only top 6 bits in Node1
+	sd.CommData[31] &= 0x3F // keep only Fr32-safe low 6 bits in Node1
 
-	// Node 2: Multicodec (64) | Multihash (64) | Reserved (124 bits) | last 2 bits of CommData
+	// Node 2: Multicodec (64) | Multihash (64) | Reserved (124 bits) | top 2 bits of CommData
 	off := merkletree.NodeSize
 	sd.Multicodec = le.Uint64(data[off:])
 	off += 8
 	sd.Multihash = le.Uint64(data[off:])
 	off += 8
-	// bytes 16-30 reserved; byte 31 of Node2: low 2 bits = CommData last 2 bits (index 32+31=63)
-	sd.CommData[31] |= data[off+15] & 0x03
+	// bytes 16-30 reserved; byte 31 of Node2: low 2 bits = CommData top 2 bits
+	sd.CommData[31] |= (data[off+15] & 0x03) << 6
 	off += 16                     // skip to end of Node2 (off was 48, 48+16=64)
 	off = 2 * merkletree.NodeSize // start of Node3
 
@@ -316,18 +316,18 @@ func (sd *SegmentDesc) SerializeFr32Into(slice []byte) {
 	le := binary.LittleEndian
 	off := 0
 
-	// Node 1: CommData 254 bits (31 bytes + top 6 bits of byte 31)
+	// Node 1: CommData 254 bits (31 bytes + low 6 bits of byte 31)
 	copy(slice[off:], sd.CommData[:])
-	slice[off+31] &= 0xFC // clear low 2 bits in serialized Node1
+	slice[off+31] &= 0x3F // clear top 2 bits in serialized Node1 for Fr32 stability
 	off += merkletree.NodeSize
 
-	// Node 2: Multicodec (64) | Multihash (64) | Reserved (15 bytes) | last 2 bits = CommData[31]&0x03
+	// Node 2: Multicodec (64) | Multihash (64) | Reserved (15 bytes) | top 2 bits = CommData[31]>>6
 	le.PutUint64(slice[off:], sd.Multicodec)
 	off += 8
 	le.PutUint64(slice[off:], sd.Multihash)
 	off += 8
-	// bytes 16-30 zero; byte 31 = low 2 bits of CommData
-	slice[off+15] = sd.CommData[31] & 0x03
+	// bytes 16-30 zero; byte 31 low bits = top 2 bits of CommData
+	slice[off+15] = sd.CommData[31] >> 6
 	off += 16 // skip to end of Node 2 (bytes 48-63 reserved), so Node 3 starts at 64
 
 	// Node 3: Node3Reserved (64) | Offset (64) | Size (64) | RawSize (62 bits)
@@ -358,14 +358,14 @@ func (sd *SegmentDesc) IntoNodes() [4]merkletree.Node {
 	// Node 1: CommData 254 bits
 	var n1 [32]byte
 	copy(n1[:], sd.CommData[:])
-	n1[31] &= 0xFC
+	n1[31] &= 0x3F
 	nodes[0] = merkletree.Node(n1)
 
 	// Node 2: Multicodec | Multihash | Reserved | last 2 bits of CommData
 	var node2 [32]byte
 	le.PutUint64(node2[0:], sd.Multicodec)
 	le.PutUint64(node2[8:], sd.Multihash)
-	node2[31] = sd.CommData[31] & 0x03
+	node2[31] = sd.CommData[31] >> 6
 	nodes[1] = merkletree.Node(node2)
 
 	// Node 3: Node3Reserved | Offset | Size | RawSize (62 bits)
@@ -416,14 +416,14 @@ func (sd *SegmentDesc) Validate() error {
 	// We only validate that Size is at least RawSize and aligned to NodeSize boundaries
 	// (which is already ensured by NewDataSegmentIndexEntry)
 
-	// Validate Multicodec (must be supported: Raw, CAR, or CID mapping section descriptor)
-	if sd.Multicodec != MulticodecRaw && sd.Multicodec != MulticodecCAR && sd.Multicodec != MulticodeIndexFooter {
-		return validationError("multicodec must be 0x55 (Raw), 0x0202 (CAR), or 0xee01 (CID mapping section)")
+	// Validate Multicodec (must be supported: Identity, Raw, or CAR)
+	if sd.Multicodec != MulticodecIdentity && sd.Multicodec != MulticodecRaw && sd.Multicodec != MulticodecCAR {
+		return validationError("multicodec must be 0x00 (Identity), 0x55 (Raw), or 0x0202 (CAR)")
 	}
 
-	// Node3Reserved must be zero for Raw, CAR, and CID mapping section
-	if sd.Multicodec == MulticodeIndexFooter && sd.Node3Reserved != 0 {
-		return validationError("node3Reserved must be zero for CID mapping section descriptor")
+	// Node3Reserved must be zero.
+	if sd.Node3Reserved != 0 {
+		return validationError("node3Reserved must be zero")
 	}
 
 	// Validate ACLType and ACLData

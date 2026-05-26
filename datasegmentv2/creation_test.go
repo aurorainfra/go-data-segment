@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	commcid "github.com/filecoin-project/go-fil-commcid"
-	commp "github.com/filecoin-project/go-fil-commp-hashhash"
 	"github.com/filecoin-project/go-state-types/abi"
 	cid "github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/assert"
@@ -456,8 +455,8 @@ func TestNewAggregate_LargeDeal(t *testing.T) {
 	assert.Equal(t, dealSize, agg.DealSize)
 }
 
-// TestAggregateV2_PieceCommP_Consistency_OffsetZero tests CommP consistency for pieces at offset 0
-func TestAggregateV2_PieceCommP_Consistency_OffsetZero(t *testing.T) {
+// TestAggregateV2_Blake3DataCID_Consistency_OffsetZero tests data CID consistency for pieces at offset 0.
+func TestAggregateV2_Blake3DataCID_Consistency_OffsetZero(t *testing.T) {
 	dealSize := abi.PaddedPieceSize(1 << 20) // 1 MiB
 	pieceData := makeTestDataCreation(1024)
 
@@ -473,35 +472,26 @@ func TestAggregateV2_PieceCommP_Consistency_OffsetZero(t *testing.T) {
 
 	agg, err := NewAggregate(dealSize, pieces)
 	agg = requireAggregateOrSkip(t, agg, err)
-	// Calculate CommP individually using commpv1
-	calc := &commp.Calc{}
 
-	n, err := calc.Write(pieceData)
-	require.NoError(t, err)
-	require.Equal(t, len(pieceData), n)
-
-	commpDigest, _, err := calc.Digest()
-	require.NoError(t, err)
-	require.NotNil(t, commpDigest)
-	require.Equal(t, 32, len(commpDigest))
-
-	// Get CommP from index entry (stored as CommData when built from CommP)
+	// Get the BLAKE3 content digest from the index entry.
 	entry := agg.Index.Entry(0)
 	require.NotNil(t, entry)
-	indexCommP := entry.CommData
+	indexDigest := entry.CommData
 
-	// Compare CommP values
-	commpCommPArray := [32]byte{}
-	copy(commpCommPArray[:], commpDigest)
+	expectedDigest, err := blake3Digest(pieceData)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(MulticodecRaw), entry.Multicodec)
+	assert.Equal(t, uint64(MultihashBlake3), entry.Multihash)
+	assert.Equal(t, expectedDigest[:], indexDigest[:],
+		"BLAKE3 digest mismatch for offset=0 piece\n"+
+			"  Index digest:     %x\n"+
+			"  calculated digest: %x",
+		indexDigest[:], expectedDigest[:])
 
-	assert.Equal(t, indexCommP[:], commpCommPArray[:],
-		"CommP mismatch for offset=0 piece\n"+
-			"  Index CommP (from tree):    %x\n"+
-			"  commpv1 CommP (calculated): %x",
-		indexCommP[:], commpCommPArray[:])
+	dataCID, err := entry.DataCID()
+	require.NoError(t, err)
+	require.True(t, dataCID.Defined())
 }
-
-
 
 // TestSegmentDesc_PieceCIDV2 asserts PieceCIDV2 is not supported in CID-based index format.
 func TestSegmentDesc_PieceCIDV2(t *testing.T) {

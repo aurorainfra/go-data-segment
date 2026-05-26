@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	commcid "github.com/filecoin-project/go-fil-commcid"
+	commp "github.com/filecoin-project/go-fil-commp-hashhash"
 	"github.com/filecoin-project/go-state-types/abi"
 	cid "github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,19 @@ func makeTestDataInclusion(size uint64) []byte {
 	data := make([]byte, size)
 	_, _ = rand.Read(data) // Ignore error in test helper
 	return data
+}
+
+func requirePieceCIDForData(t *testing.T, data []byte) cid.Cid {
+	t.Helper()
+	calc := &commp.Calc{}
+	n, err := calc.Write(data)
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
+	digest, _, err := calc.Digest()
+	require.NoError(t, err)
+	commPc, err := commcid.PieceCommitmentV1ToCID(digest)
+	require.NoError(t, err)
+	return commPc
 }
 
 // TestCollectInclusionProof_SinglePiece tests collecting inclusion proof for a single piece
@@ -152,17 +166,19 @@ func TestComputeExpectedAuxData_SinglePiece(t *testing.T) {
 	proof, err := CollectInclusionProof(agg.Tree, agg.DealSize, 0)
 	require.NoError(t, err)
 
-	// Get piece CommP from index entry (stored as CommData when built from CommP)
+	// Get the content CID from the index entry and compute the piece CommP separately.
 	entry := agg.Index.Entry(0)
 	require.NotNil(t, entry)
-	commPc, err := commcid.PieceCommitmentV1ToCID(entry.CommData[:])
+	dataCID, err := entry.DataCID()
 	require.NoError(t, err)
+	commPc := requirePieceCIDForData(t, pieceData)
 
 	// Create verifier data
 	verifierData := InclusionVerifierData{
-		CommPc: commPc,
-		Offset: pieces[0].PieceInfo.BeginAt,
-		SizePc: pieces[0].PieceInfo.RawSize,
+		CommPc:  commPc,
+		DataCID: dataCID,
+		Offset:  pieces[0].PieceInfo.BeginAt,
+		SizePc:  pieces[0].PieceInfo.RawSize,
 	}
 
 	// Compute expected aux data
@@ -196,13 +212,15 @@ func TestComputeExpectedAuxData_ZeroSize(t *testing.T) {
 	require.NoError(t, err)
 	entry := agg.Index.Entry(0)
 	require.NotNil(t, entry)
-	commPc, err := commcid.PieceCommitmentV1ToCID(entry.CommData[:])
+	dataCID, err := entry.DataCID()
 	require.NoError(t, err)
+	commPc := requirePieceCIDForData(t, pieceData)
 	// Test with zero size
 	verifierData := InclusionVerifierData{
-		CommPc: commPc,
-		Offset: 0,
-		SizePc: 0, // Zero size should cause error
+		CommPc:  commPc,
+		DataCID: dataCID,
+		Offset:  0,
+		SizePc:  0, // Zero size should cause error
 	}
 
 	_, err = proof.ComputeExpectedAuxData(verifierData)
@@ -249,11 +267,12 @@ func TestComputeExpectedAuxData_InvalidCommP(t *testing.T) {
 // This test creates a sector with multiple pieces, collects proofs for each piece,
 // and verifies that the proofs are valid and consistent.
 func TestInclusionProof_MultiplePieces_Verification(t *testing.T) {
-	dealSize := abi.PaddedPieceSize(1 << 20) // 1 MiB
+	dealSize := abi.PaddedPieceSize(1 << 21) // 2 MiB (enough index capacity for 4 pieces)
 	piece1Data := makeTestDataInclusion(1024)
 	piece2Data := makeTestDataInclusion(512)
 	piece3Data := makeTestDataInclusion(2048)
 	piece4Data := makeTestDataInclusion(256)
+	pieceDatas := [][]byte{piece1Data, piece2Data, piece3Data, piece4Data}
 
 	pieces := []PieceData{
 		{
@@ -311,22 +330,23 @@ func TestInclusionProof_MultiplePieces_Verification(t *testing.T) {
 			assert.GreaterOrEqual(t, len(proof.RightProofSubtree.Path), 0, "piece %d: right proof path is empty", i)
 			assert.GreaterOrEqual(t, len(proof.ProofIndex.Path), 0, "piece %d: index proof path is empty", i)
 
-			// Get piece CommP from index entry (stored as CommData when built from CommP)
+			// Get the content CID from the index entry and compute the piece CommP separately.
 			entry := agg.Index.Entry(i)
 			require.NotNil(t, entry, "piece %d: index entry is nil", i)
-			commPc, err := commcid.PieceCommitmentV1ToCID(entry.CommData[:])
-			require.NoError(t, err, "piece %d: failed to convert CommData to CID", i)
+			dataCID, err := entry.DataCID()
+			require.NoError(t, err, "piece %d: failed to get data CID", i)
+			commPc := requirePieceCIDForData(t, pieceDatas[i])
 			require.False(t, commPc.Equals(cid.Undef), "piece %d: piece CID is undefined", i)
 
 			// Create verifier data
 			verifierData := InclusionVerifierData{
-				CommPc: commPc,
-				Offset: piece.PieceInfo.BeginAt,
-				SizePc: piece.PieceInfo.RawSize,
+				CommPc:  commPc,
+				DataCID: dataCID,
+				Offset:  piece.PieceInfo.BeginAt,
+				SizePc:  piece.PieceInfo.RawSize,
 			}
 
-			// Verify that the piece CommP matches what we expect
-			// The CommP in the index should match the piece's actual CommP
+			// Verify that the index entry matches what we expect.
 			assert.Equal(t, piece.PieceInfo.BeginAt, entry.Offset, "piece %d: offset mismatch", i)
 			assert.Equal(t, piece.PieceInfo.RawSize, entry.RawSize, "piece %d: raw size mismatch", i)
 
@@ -334,7 +354,7 @@ func TestInclusionProof_MultiplePieces_Verification(t *testing.T) {
 			auxData, err := proof.ComputeExpectedAuxData(verifierData)
 			require.NoError(t, err, "piece %d: failed to compute expected aux data", i)
 			require.NotNil(t, auxData, "piece %d: aux data is nil", i)
-			
+
 			// Verify the results match expected values
 			assert.Equal(t, sectorRoot, auxData.CommPa, "piece %d: sector root mismatch", i)
 			assert.Equal(t, dealSize, auxData.SizePa, "piece %d: deal size mismatch", i)
@@ -353,22 +373,22 @@ func TestInclusionProof_MultiplePieces_Verification(t *testing.T) {
 		})
 	}
 
-	// Verify that all pieces have different CommPs (unless they have identical data)
-	commPs := make([]cid.Cid, len(pieces))
+	// Verify that all pieces have different data CIDs (unless they have identical data).
+	dataCIDs := make([]cid.Cid, len(pieces))
 	for i := 0; i < len(pieces); i++ {
 		entry := agg.Index.Entry(i)
 		require.NotNil(t, entry)
-		commP, err := commcid.PieceCommitmentV1ToCID(entry.CommData[:])
+		dataCID, err := entry.DataCID()
 		require.NoError(t, err)
-		commPs[i] = commP
+		dataCIDs[i] = dataCID
 	}
 
-	// Check that pieces with different data have different CommPs
-	// (This is probabilistic - very unlikely for random data to have same CommP)
-	for i := 0; i < len(commPs); i++ {
-		for j := i + 1; j < len(commPs); j++ {
-			if commPs[i].Equals(commPs[j]) {
-				t.Logf("Warning: pieces %d and %d have the same CommP (unlikely but possible)", i, j)
+	// Check that pieces with different data have different content CIDs.
+	// (This is probabilistic - very unlikely for random data to have same digest.)
+	for i := 0; i < len(dataCIDs); i++ {
+		for j := i + 1; j < len(dataCIDs); j++ {
+			if dataCIDs[i].Equals(dataCIDs[j]) {
+				t.Logf("Warning: pieces %d and %d have the same data CID (unlikely but possible)", i, j)
 			}
 		}
 	}

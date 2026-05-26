@@ -1,6 +1,7 @@
 package datasegmentv2
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/binary"
 	"testing"
@@ -153,7 +154,7 @@ func TestMarshalBinary(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, data)
 
-	// Layout: index only = 2 blob entries + 1 sentinel = 3 entries
+	// Layout: index only = 2 blob entries + 1 descriptor = 3 entries
 	assert.Equal(t, 3*EntrySize, len(data))
 }
 
@@ -220,7 +221,7 @@ func TestIndexSize(t *testing.T) {
 	entries := []*SegmentDesc{entry1, entry2, entry3}
 	index := makeTestIndex(t, entries)
 
-	expectedSize := uint64(3) * uint64(EntrySize)
+	expectedSize := uint64(4) * uint64(EntrySize)
 	assert.Equal(t, expectedSize, index.IndexSize())
 }
 
@@ -265,7 +266,7 @@ func TestIndexSerializationRoundTrip(t *testing.T) {
 	err = decoded.UnmarshalBinary(data)
 	require.NoError(t, err)
 
-	// Decoded has same entries as original; MulticodeIndexFooter is not kept in Entries
+	// Decoded has same entries as original; the descriptor is not kept in Entries.
 	assert.Equal(t, index.NumPieces(), decoded.NumPieces())
 
 	for i := 0; i < index.NumPieces(); i++ {
@@ -314,7 +315,7 @@ func TestMarshalBinary_WithNilEntries(t *testing.T) {
 	data, err := index.MarshalBinary()
 	require.NoError(t, err)
 
-	// Index only: 3 blob + 1 sentinel = 4 entries
+	// Index only: 3 blob + 1 descriptor = 4 entries
 	assert.Equal(t, 4*EntrySize, len(data))
 }
 
@@ -333,7 +334,7 @@ func TestUnmarshalBinary_MultipleEntries(t *testing.T) {
 	err = decoded.UnmarshalBinary(data)
 	require.NoError(t, err)
 
-	// 10 blob entries only; MulticodeIndexFooter is discarded
+	// 10 blob entries only; descriptor is discarded.
 	assert.Equal(t, 10, decoded.NumPieces())
 
 	for i := 0; i < 10; i++ {
@@ -365,9 +366,9 @@ func TestUnmarshalBinary_EntriesHaveDataCID(t *testing.T) {
 	assert.Equal(t, 0, decoded.Search(c1))
 }
 
-// TestMarshalBinary_SentinelOffsetSize verifies that the sentinel (last entry) in MarshalBinary
-// carries the index section offset and size so ParseIndexSection can locate the index.
-func TestMarshalBinary_SentinelOffsetSize(t *testing.T) {
+// TestMarshalBinary_Descriptor verifies that the descriptor (last entry) in MarshalBinary
+// carries the index section offset, size, and BLAKE3 digest so ParseIndexSection can locate and verify the index.
+func TestMarshalBinary_Descriptor(t *testing.T) {
 	entry := NewDataSegmentIndexEntryFromMultihash(MultihashBlake3, []byte{1, 2, 3}, 0, 256)
 	entry.WithUpdatedChecksum()
 	const indexStart = 121634816
@@ -379,12 +380,19 @@ func TestMarshalBinary_SentinelOffsetSize(t *testing.T) {
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(data), 2*EntrySize)
 	lastEntry := data[len(data)-EntrySize:]
+	var descriptor SegmentDesc
+	require.NoError(t, descriptor.UnmarshalBinary(lastEntry))
+	require.Equal(t, uint64(MulticodecIdentity), descriptor.Multicodec)
+	require.Equal(t, uint64(MultihashBlake3), descriptor.Multihash)
+	digest, err := blake3Digest(data[:len(data)-EntrySize])
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(digest[:], descriptor.CommData[:]))
 	// Node 3: bytes 64-95 contain Node3Reserved(8), Offset(8), Size(8), RawSize(8)
 	off := 2 * 32
 	offsetInSentinel := binary.LittleEndian.Uint64(lastEntry[off+8:])
 	sizeInSentinel := binary.LittleEndian.Uint64(lastEntry[off+16:])
-	require.Equal(t, uint64(indexStart), offsetInSentinel, "sentinel must carry index offset for ParseIndexSection")
-	require.Equal(t, uint64(len(data)), sizeInSentinel, "sentinel must carry index size")
+	require.Equal(t, uint64(indexStart), offsetInSentinel, "descriptor must carry index offset for ParseIndexSection")
+	require.Equal(t, uint64(len(data)), sizeInSentinel, "descriptor must carry index size")
 }
 
 func TestIndexDataV2_ImplementsPieceIndex(t *testing.T) {
